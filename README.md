@@ -197,6 +197,18 @@ m.search("What is Caroline's dog called?", user_id="alice")   # -> "Caroline ado
 - **Bring your own model:** `llm` can be a dict, a callable `fn(system, user) -> str`, or any object with
   `generate()`; `embedder` any object with `embed_batch(texts, action)` and a `name`. A store records which
   embedder made its vectors and refuses to open with a different one.
+- **Cloud LLM instead of local Ollama:** `llm={"provider": "muse"}`, `{"provider": "deepseek"}`, or
+  `{"provider": "openai"}` (`gpt-5-nano`, task 0099) routes extraction through that provider's API
+  instead — reads the API key from `$MUSE_API_KEY`/`$DEEPSEEK_API_KEY`/`$OPENAI_API_KEY` (or pass
+  `api_key=` in the dict), `model=`/`base_url=` override that provider's default. `openai`'s preset
+  also sets `temperature=1` and `reasoning_effort="minimal"` by default — verified live: `gpt-5-nano`
+  rejects `temperature=0` (400) and otherwise burns hundreds of hidden reasoning tokens even on a
+  trivial reply; both are overridable in the same dict if you want its full reasoning instead.
+  A fully custom OpenAI-compatible endpoint: `{"provider": "cloud", "base_url": ..., "model": ..., "api_key": ...}`.
+  **This sends your real ingested text to that provider** — know its data-handling terms (e.g. Muse Spark's
+  contributor tier trains on what it's sent) before pointing it at anything sensitive. `Memory.answer()`
+  (the query-time reader) takes the same `llm=` spec, so extraction and answering can use the same cloud
+  model, different ones, or stay local — independent per call.
 - **Failure is loud:** an unreachable LLM or embedder raises `LLMError` (nothing is stored). "The model found
   nothing worth remembering" is a normal empty result.
 - **It costs an LLM call per `add`** (plus embeddings). The `raw` engine costs none.

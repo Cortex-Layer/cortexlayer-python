@@ -150,3 +150,86 @@ def test_provenance_dedupe_keeps_direct(tmp_path):
     assert all(p["via"] == "direct" for p in passages if "linked_from" not in p)
     # Mutual links: each page links the other, both are seeds — no link rows survive.
     assert all("linked_from" not in p for p in passages), by_id
+
+
+# --- retrieve_fused (task 0093: RRF fusion + MMR) --------------------------
+
+
+def test_retrieve_fused_pulls_linked_page(tmp_path):
+    col = _fresh_collection(tmp_path)
+    _seed_two_hop(col)
+    seeds = storage.query(col, "Who directed Inception?", n_results=1)
+    passages = retrieval.retrieve_fused(col, seeds, "Who directed Inception?")
+    texts = [p["text"] for p in passages]
+    assert any("director" in t for t in texts)
+    assert any("1970" in t for t in texts)
+
+
+def test_retrieve_fused_dedupes_and_marks_provenance(tmp_path):
+    col = _fresh_collection(tmp_path)
+    _seed_two_hop(col)
+    seeds = storage.query(col, "Who directed Inception?", n_results=1)
+    passages = retrieval.retrieve_fused(col, seeds, "Who directed Inception?")
+    ids = [p["page_id"] for p in passages]
+    assert len(ids) == len(set(ids))
+    seed_id = seeds[0]["id"]
+    direct = next(p for p in passages if p["page_id"] == seed_id)
+    assert direct["via"] == "direct"
+    assert "linked_from" not in direct
+    linked = next(p for p in passages if p["page_id"] != seed_id)
+    assert linked["via"] == "link"
+    assert linked["linked_from"] == seed_id
+    assert "created_at" not in linked  # internal fusion field, stripped from output
+
+
+def test_retrieve_fused_ranks_the_full_neighbor_pool_not_just_per_seed_top1(tmp_path):
+    """A seed with three linked candidates: fusion should be able to surface
+    the most query-relevant one even though expand_links(top_n=1) would only
+    ever have looked at each seed's own single best pick — here there's only
+    one seed, so this also proves the ranking-over-the-whole-pool wiring.
+
+    Links are wired directly (not via the entity-overlap linking pass, whose
+    0011 denoising would drop a name shared by 4+ pages below its minimum
+    link weight) — this test is about neighbor RANKING, not linking itself.
+    """
+    col = _fresh_collection(tmp_path)
+    seed_id = ingestion.ingest_text(col, "The director of Inception is Christopher Nolan.")[0]
+    for pid, text in (
+        ("a" * 32, "Christopher Nolan directed Dunkirk in 2017."),
+        ("b" * 32, "Christopher Nolan enjoys long walks."),
+        ("z" * 32, "Christopher Nolan was born on July 30, 1970."),
+    ):
+        storage.insert_page(col, text, ["Christopher Nolan"], page_id=pid)
+        storage.append_link(col, seed_id, pid)
+    seeds = [storage.get_page(col, seed_id)]
+    seeds[0]["score"] = 0.0
+    passages = retrieval.retrieve_fused(col, seeds, "When was the director of Inception born?")
+    linked_texts = [p["text"] for p in passages if p["via"] == "link"]
+    assert any("1970" in t for t in linked_texts)
+
+
+def test_retrieve_fused_empty_seeds(tmp_path):
+    col = _fresh_collection(tmp_path)
+    _seed_two_hop(col)
+    assert retrieval.retrieve_fused(col, [], "anything") == []
+
+
+def test_retrieve_fused_no_mmr_still_dedupes(tmp_path):
+    col = _fresh_collection(tmp_path)
+    _seed_two_hop(col)
+    seeds = storage.query(col, "Inception Nolan", n_results=5)
+    passages = retrieval.retrieve_fused(col, seeds, "Inception Nolan", use_mmr=False)
+    ids = [p["page_id"] for p in passages]
+    assert len(ids) == len(set(ids))
+    assert len(passages) == 2  # both pages, mutual links, no duplicates
+
+
+def test_retrieve_fused_temporal_query_does_not_crash_or_drop_results(tmp_path):
+    """The recency voice only joins fusion for temporal-looking queries — just
+    confirm it wires in without breaking dedup/count when it does."""
+    col = _fresh_collection(tmp_path)
+    _seed_two_hop(col)
+    seeds = storage.query(col, "When was the director born?", n_results=5)
+    passages = retrieval.retrieve_fused(col, seeds, "When was the director born?")
+    assert len({p["page_id"] for p in passages}) == len(passages)
+    assert len(passages) == 2

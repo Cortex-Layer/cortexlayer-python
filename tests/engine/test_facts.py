@@ -178,7 +178,8 @@ def test_prompt_carries_context_and_hides_real_ids(eng, llm):
     first = eng.add("u", "Caroline adopted a dog named Max.")
     eng.add("u", "Max learned to swim in Boston harbour.")
     system, user = llm.calls[1]
-    assert system == prompts.extraction_system_prompt()
+    # `eng`'s default supersede=True (0094) asks for the structured subject/predicate fields.
+    assert system == prompts.extraction_system_prompt(structured_fields=True)
     existing = json.loads(user.split("## Existing Memories\n")[1].split("\n\n## New Messages")[0])
     assert existing == [{"id": "0", "text": "Caroline adopted a dog named Max."}]
     assert first[0]["id"] not in user                                   # only "0".."9"

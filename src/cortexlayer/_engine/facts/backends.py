@@ -1,4 +1,6 @@
-"""Pluggable LLM and embedder for fact memory.
+"""Pluggable embedder for fact memory, plus the LLM backend re-exported from
+``_engine.llm`` (task 0099 moved it there so ``compression.py``'s reader can
+share it without importing the facts subpackage — see that module's docstring).
 
 Defaults mirror the Cortex server's Mem0 configuration (Ollama, ``think`` off,
 temperature/top_p/num_predict as Mem0's Ollama client: 0.1 / 0.1 / 2000) so the
@@ -8,26 +10,24 @@ and other providers need no Ollama.
 
 from __future__ import annotations
 
-import os
-from typing import Any, Callable, List, Optional, Protocol, Sequence
+from typing import Any, List, Optional, Protocol, Sequence
 
 import httpx
 
 from ...errors import CortexConfigError, LLMError
+from ..llm import (  # noqa: F401 — re-exported for existing importers
+    CLOUD_PROVIDERS,
+    DEFAULT_LLM_MODEL,
+    DEFAULT_OLLAMA_HOST,
+    LLM,
+    CloudLLM,
+    OllamaLLM,
+    _CallableLLM,
+    ollama_host,
+    resolve_llm,
+)
 
-DEFAULT_OLLAMA_HOST = "http://localhost:11434"
-DEFAULT_LLM_MODEL = "qwen3.5:9b"
 DEFAULT_OLLAMA_EMBED_MODEL = "qwen3-embedding:8b"
-
-
-def ollama_host() -> str:
-    return os.environ.get("OLLAMA_HOST", DEFAULT_OLLAMA_HOST).rstrip("/")
-
-
-class LLM(Protocol):
-    def generate(self, system: str, user: str) -> str:
-        """Return the model's raw reply (expected to be a JSON object string)."""
-        ...
 
 
 class Embedder(Protocol):
@@ -36,56 +36,6 @@ class Embedder(Protocol):
     def embed_batch(self, texts: Sequence[str], action: str = "add") -> List[List[float]]:
         """One vector per text. ``action`` is ``add`` | ``search`` | ``update``."""
         ...
-
-
-class OllamaLLM:
-    """Chat model over Ollama's ``/api/chat`` with native JSON output."""
-
-    def __init__(
-        self,
-        model: str = DEFAULT_LLM_MODEL,
-        host: Optional[str] = None,
-        *,
-        temperature: float = 0.1,
-        top_p: float = 0.1,
-        max_tokens: int = 2000,
-        think: bool = False,
-        timeout: float = 300.0,
-        http_client: Optional[httpx.Client] = None,
-    ) -> None:
-        self.model = model
-        self.host = (host or ollama_host()).rstrip("/")
-        self._opts = {"temperature": temperature, "top_p": top_p, "num_predict": max_tokens}
-        self._think = think
-        self._timeout = timeout
-        self._http = http_client
-
-    def generate(self, system: str, user: str) -> str:
-        body = {
-            "model": self.model,
-            "messages": [
-                {"role": "system", "content": system},
-                # Same nudge Mem0's Ollama client appends for JSON mode.
-                {"role": "user", "content": user + "\n\nPlease respond with valid JSON only."},
-            ],
-            "format": "json",
-            "stream": False,
-            # Thinking models otherwise return a trace and JSON extraction
-            # silently yields nothing (verified with qwen3.5:9b).
-            "think": self._think,
-            "options": self._opts,
-        }
-        try:
-            client = self._http or httpx.Client(timeout=self._timeout)
-            try:
-                resp = client.post(f"{self.host}/api/chat", json=body)
-            finally:
-                if self._http is None:
-                    client.close()
-            resp.raise_for_status()
-            return resp.json()["message"]["content"]
-        except (httpx.HTTPError, KeyError, ValueError) as e:
-            raise LLMError(f"LLM call to {self.host} ({self.model}) failed: {e}") from e
 
 
 class OllamaEmbedder:
@@ -145,32 +95,6 @@ class ChromaEmbedder:
 
             self._fn = DefaultEmbeddingFunction()
         return [[float(x) for x in v] for v in self._fn(list(texts))]
-
-
-class _CallableLLM:
-    def __init__(self, fn: Callable[[str, str], str]) -> None:
-        self._fn = fn
-
-    def generate(self, system: str, user: str) -> str:
-        return self._fn(system, user)
-
-
-def resolve_llm(spec: Any) -> LLM:
-    """``None`` → default Ollama; dict → ``OllamaLLM(**dict)``; an object with
-    ``generate`` → itself; a callable ``fn(system, user) -> str`` → wrapped."""
-    if spec is None:
-        return OllamaLLM()
-    if isinstance(spec, dict):
-        cfg = dict(spec)
-        provider = cfg.pop("provider", "ollama")
-        if provider != "ollama":
-            raise CortexConfigError(f"unknown llm provider {provider!r} (only 'ollama' is built in)")
-        return OllamaLLM(**cfg)
-    if hasattr(spec, "generate"):
-        return spec
-    if callable(spec):
-        return _CallableLLM(spec)
-    raise CortexConfigError(f"llm must be None, a dict, a callable or an object with generate(); got {spec!r}")
 
 
 def resolve_embedder(spec: Any) -> Embedder:

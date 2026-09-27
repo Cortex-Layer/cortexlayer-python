@@ -11,9 +11,13 @@ from __future__ import annotations
 
 from chromadb.api.models.Collection import Collection
 
-from . import storage
+from . import fusion, storage
 
-DEFAULT_K = 4
+DEFAULT_K = 50
+# Raised from 4 -> 50 (task 0101): judged LOCOMO open-domain subset showed
+# +0.231 Muse-judge accuracy / +0.095 F1 (0.385/0.189 -> 0.615/0.284, n=13,
+# same ingest) from budget alone, no ranking/architecture change. Still a
+# single-conversation subset, not the full suite — see task 0101 notes.
 
 
 def retrieve(collection: Collection, query: str, k: int = DEFAULT_K) -> list[dict]:
@@ -120,3 +124,92 @@ def expand_links(
                 _add(target["id"], target["text"], score,
                      "link", linked_from=seed["id"], tags=target.get("tags"))
     return passages
+
+
+def retrieve_fused(
+    collection: Collection,
+    seeds: list[dict],
+    query: str,
+    top_n: int = 1,
+    query_embedding: list[float] | None = None,
+    rrf_k: int = fusion.DEFAULT_RRF_K,
+    use_mmr: bool = True,
+    mmr_lambda: float = fusion.DEFAULT_MMR_LAMBDA,
+) -> list[dict]:
+    """Task 0093: seeds + link-expansion, unified by Reciprocal Rank Fusion
+    instead of :func:`expand_links`'s two-stage "rank seeds, then separately
+    rank+append top-``top_n`` links per seed" pipeline, plus a post-fusion MMR
+    diversity re-rank. Same passage shape as :func:`expand_links`
+    (``page_id``/``text``/``score``/``via``/``linked_from``/``tags``); ``score``
+    here is the fused RRF score (higher = better), not a Chroma distance.
+
+    Voices fused (see ``fusion`` module):
+      - **seed** — the order ``seeds`` already arrives in (this backend's own
+        scoring: vector distance for raw, 0079's fused score for facts);
+      - **link** — ALL of the seeds' linked neighbors (not just each seed's
+        top-``top_n``), ranked together by relevance to ``query`` in one pass,
+        so fusion can pick a strong neighbor of seed 3 over a weak one of
+        seed 1 — the per-seed cap in :func:`expand_links` can't do that;
+      - **recency** — only when ``fusion.has_temporal_cue(query)`` is true.
+
+    The final passage count matches the upper bound :func:`expand_links` with
+    the same ``top_n`` would produce (``len(seeds) + top_n * len(seeds)``,
+    capped by however many distinct candidates actually exist) — fusion
+    chooses FROM a wider pool, but the OUTPUT is the same size, so a paired
+    eval against :func:`expand_links` isolates fusion+MMR from a change in
+    retrieval breadth.
+    """
+    seed_ids = [s["id"] for s in seeds]
+    by_id: dict[str, dict] = {
+        s["id"]: {
+            "page_id": s["id"], "text": s["text"], "via": "direct",
+            "created_at": s.get("created_at", ""), "tags": s.get("tags"),
+        }
+        for s in seeds
+    }
+
+    neighbor_ids = sorted({nid for s in seeds for nid in s.get("links", [])} - set(seed_ids))
+    link_from: dict[str, str] = {}
+    for s in seeds:
+        for nid in s.get("links", []):
+            if nid in neighbor_ids:
+                link_from.setdefault(nid, s["id"])
+
+    link_ranked = (
+        _rank_neighbors(collection, neighbor_ids, len(neighbor_ids),
+                         query=query, query_embedding=query_embedding)
+        if neighbor_ids else []
+    )
+    link_ids = [nid for nid, _ in link_ranked]
+    for nid in link_ids:
+        target = storage.get_page(collection, nid)
+        if target is not None:
+            by_id[nid] = {
+                "page_id": nid, "text": target["text"], "via": "link",
+                "linked_from": link_from.get(nid),
+                "created_at": target.get("created_at", ""), "tags": target.get("tags"),
+            }
+
+    if not by_id:
+        return []
+
+    voices = [seed_ids, link_ids]
+    if fusion.has_temporal_cue(query):
+        voices.append(fusion.recency_rank(list(by_id.values())))
+    scores = fusion.reciprocal_rank_fusion(voices, k=rrf_k)
+
+    pool = [{**passage, "score": scores.get(pid, 0.0)} for pid, passage in by_id.items()]
+    pool.sort(key=lambda p: p["score"], reverse=True)
+
+    target_count = min(len(seed_ids) + top_n * len(seed_ids), len(pool))
+    if use_mmr:
+        selected = fusion.mmr_rerank(pool, target_count, lam=mmr_lambda)
+    else:
+        selected = pool[:target_count]
+    for p in selected:
+        p.pop("created_at", None)  # internal to fusion, not part of the public passage shape
+        if p.get("linked_from") is None:
+            p.pop("linked_from", None)
+        if not p.get("tags"):
+            p.pop("tags", None)
+    return selected

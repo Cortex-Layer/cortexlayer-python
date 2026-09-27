@@ -19,9 +19,52 @@ PAST_MESSAGE_TRUNCATION_LIMIT = 300
 
 _prompt_cache: Optional[str] = None
 
+# Task 0094: appended (not merged into the Mem0-ported file above, which stays
+# byte-identical) when the caller wants supersede-on-write. Deliberately its
+# own clearly-flagged section near the end of the prompt rather than a change
+# threaded through Mem0's own examples — asking a well-isolated, explicit
+# schema addition of two short fields is the kind of instruction models
+# follow reliably even late in a long prompt; rewriting a dozen tuned examples
+# to also carry a subject/predicate pair was judged not worth the risk of
+# quietly moving the (already-validated) extraction quality this file
+# encodes. Kept alongside the base prompt (not appended unconditionally) so a
+# store that never opts into supersede is byte-identical to pre-0094 output.
+_STRUCTURED_FIELDS_ADDENDUM = """
 
-def extraction_system_prompt() -> str:
-    """The additive (ADD-only) extraction system prompt, from package data."""
+# STRUCTURED FIELDS (Cortex extension, not part of the Mem0 schema above)
+
+In addition to the fields above, include on every memory object:
+
+- "subject" (string, required): the canonical name of the entity this memory
+  is primarily ABOUT — "User", or a real name once one is known (e.g.
+  "Marcus"), never a bare pronoun. Same subject a human would put in a
+  database row's primary key for "whose attribute is this".
+- "predicate" (string, required): a short, lowercase, underscore_separated
+  name for the KIND of fact — e.g. "prefers", "lives_in", "works_as",
+  "has_pet", "age", "relationship_status". Reuse the SAME predicate string
+  for facts describing the same kind of attribute about a subject, even when
+  the wording differs, so a later fact can be recognized as an update to an
+  earlier one about the same subject+attribute (e.g. always "prefers", never
+  a new predicate per specific preference). Favor a small, reused vocabulary
+  over inventing a new predicate for every memory — when in doubt, pick the
+  most general predicate that still distinguishes this KIND of fact from
+  others about the same subject.
+
+Example: {"id": "0", "text": "User switched from almond milk to oat milk \
+lattes after developing an almond sensitivity", "subject": "User", \
+"predicate": "prefers"}
+"""
+
+
+def extraction_system_prompt(structured_fields: bool = False) -> str:
+    """The additive (ADD-only) extraction system prompt, from package data.
+
+    ``structured_fields`` (task 0094): also ask for ``subject``/``predicate``
+    per memory, so :meth:`FactEngine.add`'s supersede-on-write can close out
+    an existing fact sharing the same (subject, predicate). Off by default —
+    a store that never enables ``supersede`` gets byte-identical output to
+    pre-0094 Cortex.
+    """
     global _prompt_cache
     if _prompt_cache is None:
         _prompt_cache = (
@@ -29,7 +72,7 @@ def extraction_system_prompt() -> str:
             .joinpath("additive_extraction_prompt.txt")
             .read_text(encoding="utf-8")
         )
-    return _prompt_cache
+    return _prompt_cache + _STRUCTURED_FIELDS_ADDENDUM if structured_fields else _prompt_cache
 
 
 def _truncate(text: str, limit: int = PAST_MESSAGE_TRUNCATION_LIMIT) -> str:

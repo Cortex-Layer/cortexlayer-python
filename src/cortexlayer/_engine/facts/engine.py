@@ -26,7 +26,16 @@ Differences from Mem0, all deliberate:
 - BM25 keyword term is opt-in (``keyword_weight``; Mem0 has it but it is inactive with
   Chroma, so off = identical to Mem0 — see ``scoring`` and task 0079);
 - an embedding *outage* raises instead of silently dropping facts;
-- ``linked_memory_ids`` in the LLM output is ignored, exactly as Mem0 ignores it.
+- ``linked_memory_ids`` in the LLM output is ignored, exactly as Mem0 ignores it;
+- supersede-on-write (task 0094, ``supersede``, default on): every fact gets a
+  ``valid_from``/``valid_until`` validity window (schema always present, independent of
+  this flag — a fact never gets a ``valid_until`` unless something actually supersedes
+  it). When on, the extraction prompt also asks for a ``subject``/``predicate`` pair per
+  fact; a new fact sharing (subject, predicate) with an existing OPEN fact closes that
+  fact's window (``valid_until = `` the new fact's ``valid_from``) — Mem0 has no
+  equivalent, it is pure append-only. ``seeds()`` defaults to current-truth-only
+  (``valid_from <= as_of <= valid_until``, ``as_of`` = now); pass ``as_of`` to retrieve
+  history. Not part of Mem0's design at all — see ``docs/cortex-architecture.md`` §7.
 """
 
 from __future__ import annotations
@@ -38,6 +47,7 @@ import os
 import re
 import sqlite3
 import threading
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence
 
 from ...errors import CortexConfigError, LLMError
@@ -152,6 +162,47 @@ def _norm(text: str) -> str:
     return " ".join(text.strip().lower().split())
 
 
+def _parse_iso(ts: Optional[str]):
+    """``ts`` -> aware ``datetime``, or ``None`` if missing/unparseable.
+
+    ``created_at``/``valid_from``/``valid_until`` are not guaranteed
+    ISO-8601 — ``add(timestamp=...)`` accepts any caller-supplied string
+    (e.g. LOCOMO's ``"8 May, 2023"``), same latitude the raw backend and
+    task 0093's recency voice already give it. Unparseable never raises —
+    it just means this timestamp can't participate in the validity check
+    below, not that the fact should be hidden or the call should fail.
+    """
+    if not ts:
+        return None
+    try:
+        dt = datetime.fromisoformat(ts)
+    except ValueError:
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def _is_current(metadata: Optional[Dict[str, Any]], as_of: Optional[str]) -> bool:
+    """Task 0094: current-truth-only filter for ``seeds()``.
+
+    A fact with neither field (pre-0094 data, or a store that never enabled
+    ``supersede``) is always current. Fails OPEN on an unparseable
+    timestamp on either side — a badly-formatted date should never hide a
+    fact that would otherwise be findable, it just means this fact doesn't
+    get to benefit from (or be excluded by) versioning.
+    """
+    meta = metadata or {}
+    valid_from = _parse_iso(meta.get("valid_from"))
+    valid_until = _parse_iso(meta.get("valid_until"))
+    if valid_from is None and valid_until is None:
+        return True
+    cutoff = _parse_iso(as_of) or datetime.now(timezone.utc)
+    if valid_from is not None and valid_from > cutoff:
+        return False
+    if valid_until is not None and valid_until <= cutoff:
+        return False
+    return True
+
+
 class FactEngine:
     """LLM fact extraction + entity-boosted search over per-user Chroma collections."""
 
@@ -167,6 +218,7 @@ class FactEngine:
         threshold: float = SEARCH_THRESHOLD,
         observation_date_from_timestamp: bool = False,
         keyword_weight: float = 0.0,
+        supersede: bool = True,
     ) -> None:
         self._client = client
         self._llm = llm
@@ -183,6 +235,10 @@ class FactEngine:
         self._obs_from_ts = observation_date_from_timestamp
         # 0 = no keyword term (identical to Mem0 on Chroma); >0 fuses BM25 into search.
         self._kw_weight = max(float(keyword_weight), 0.0)
+        # Task 0094: also ask the extractor for subject/predicate and auto-close
+        # a superseded fact on write. valid_from/valid_until schema stays regardless
+        # (see the class docstring); this only controls whether closing happens.
+        self._supersede = bool(supersede)
         self._messages = _Messages(os.path.join(data_dir, "cortexlayer_facts.db"))
 
     # --- collections ---
@@ -266,7 +322,9 @@ class FactEngine:
             timestamp=timestamp if self._obs_from_ts else None,
         )
         try:
-            reply = self._llm.generate(prompts.extraction_system_prompt(), user_prompt)
+            reply = self._llm.generate(
+                prompts.extraction_system_prompt(structured_fields=self._supersede), user_prompt
+            )
         except LLMError:
             raise
         except Exception as e:  # noqa: BLE001
@@ -305,9 +363,16 @@ class FactEngine:
             if h in existing_hashes or h in seen:
                 continue
             seen.add(h)
-            extra: Dict[str, Any] = {"hash": h, "updated_at": now}
+            # valid_from is always stamped (schema present regardless of `supersede` —
+            # see the class docstring); subject/predicate only exist when the
+            # extractor was asked for them (self._supersede was on for this call).
+            extra: Dict[str, Any] = {"hash": h, "updated_at": now, "valid_from": stamp}
             if m.get("attributed_to"):
                 extra["attributed_to"] = str(m["attributed_to"])
+            if m.get("subject"):
+                extra["subject"] = str(m["subject"])
+            if m.get("predicate"):
+                extra["predicate"] = str(m["predicate"])
             records.append({"text": t, "vector": vectors[t], "extra": extra})
         if not records:
             self._messages.save(user_id, messages)
@@ -323,6 +388,14 @@ class FactEngine:
             rec["id"] = pid
             out.append({"id": pid, "text": rec["text"]})
 
+        # Phase 6.5: supersede-on-write (task 0094, best effort — a failure here
+        # must not lose the new fact, it just means an old one stays visible too).
+        if self._supersede:
+            try:
+                self._supersede_facts(facts, records, stamp)
+            except Exception as e:  # noqa: BLE001
+                log.warning("supersede-on-write failed: %s", e)
+
         # Phase 7: entity index (best effort, as Mem0)
         try:
             self._link_entities(user_id, records)
@@ -331,6 +404,55 @@ class FactEngine:
 
         self._messages.save(user_id, messages)
         return out
+
+    def _supersede_facts(
+        self, facts: Any, records: List[Dict[str, Any]], valid_from: str
+    ) -> None:
+        """Close any OTHER fact in this collection sharing a new record's
+        normalized (subject, predicate) and still open (no ``valid_until``).
+
+        Exact-string match on normalized (trim+lowercase) subject/predicate —
+        the extraction prompt already asks the model to reuse a canonical
+        subject name and a small predicate vocabulary (see
+        ``prompts._STRUCTURED_FIELDS_ADDENDUM``), so this starts simple
+        rather than layering 0087's fuzzy entity-dedup on top before there's
+        evidence exact-match is too brittle in practice. Chained correctly
+        within one batch: if two new records in the same ``add()`` call share
+        a key, the second closes the first, not just whatever was open
+        before this call started.
+        """
+        keyed = [
+            (rec["id"], _norm(rec["extra"]["subject"]), _norm(rec["extra"]["predicate"]))
+            for rec in records
+            if rec["extra"].get("subject") and rec["extra"].get("predicate")
+        ]
+        if not keyed:
+            return
+        new_ids = {rec["id"] for rec in records}
+        # Read every fact's (subject, predicate, valid_until) once — same
+        # "exact and always in sync, O(facts)" tradeoff _keyword_scores
+        # already makes; fine at the per-user scale facts stores run at.
+        existing = facts.get(include=["metadatas"])
+        open_by_key: Dict[tuple, List[str]] = {}
+        for pid, meta in zip(existing["ids"], existing["metadatas"] or []):
+            if pid in new_ids:
+                continue  # this batch's own new rows aren't "existing" to supersede
+            meta = meta or {}
+            if meta.get("valid_until") is not None:
+                continue
+            subj, pred = meta.get("subject"), meta.get("predicate")
+            if not subj or not pred:
+                continue
+            open_by_key.setdefault((_norm(subj), _norm(pred)), []).append(pid)
+
+        to_close: set = set()
+        for new_id, subj_key, pred_key in keyed:
+            key = (subj_key, pred_key)
+            to_close.update(open_by_key.get(key, ()))
+            open_by_key[key] = [new_id]  # this record is now the open one for this key
+
+        for pid in to_close:
+            facts.update(ids=[pid], metadatas=[{"valid_until": valid_from}])
 
     def _link_entities(self, user_id: str, records: List[Dict[str, Any]]) -> None:
         if self._spacy is None:
@@ -451,9 +573,18 @@ class FactEngine:
 
     # --- search ---
 
-    def seeds(self, user_id: str, query: str, limit: int) -> List[dict]:
+    def seeds(
+        self, user_id: str, query: str, limit: int, as_of: Optional[str] = None
+    ) -> List[dict]:
         """Top ``limit`` facts for ``query`` as storage-shaped page dicts with a
-        fused ``score`` (higher = better)."""
+        fused ``score`` (higher = better).
+
+        Defaults to current-truth-only (task 0094): a fact whose validity
+        window has been closed by a later fact sharing its (subject,
+        predicate) is excluded. Pass ``as_of`` (an ISO timestamp) to
+        retrieve history as it stood at that moment instead of now. A store
+        that never enables ``supersede`` never closes a window, so this is a
+        no-op for it — every fact stays visible, exactly as before 0094."""
         facts = self.collection(user_id)
         total = facts.count()
         if total == 0:
@@ -471,11 +602,12 @@ class FactEngine:
             for pid, doc, meta, dist in zip(
                 res["ids"][0], res["documents"][0], res["metadatas"][0], res["distances"][0]
             )
+            if _is_current(meta, as_of)
         ]
         boosts = self._entity_boosts(user_id, query_entities) if query_entities else {}
         keyword: Dict[str, float] = {}
         if self._kw_weight > 0:
-            keyword = self._keyword_scores(facts, query, qvec, candidates)
+            keyword = self._keyword_scores(facts, query, qvec, candidates, as_of)
         ranked = scoring.score_and_rank(
             candidates, boosts, self._threshold, limit, keyword, self._kw_weight
         )
@@ -487,11 +619,14 @@ class FactEngine:
         return pages
 
     def _keyword_scores(
-        self, facts: Any, query: str, qvec: Sequence[float], candidates: List[Dict[str, Any]]
+        self, facts: Any, query: str, qvec: Sequence[float], candidates: List[Dict[str, Any]],
+        as_of: Optional[str] = None,
     ) -> Dict[str, float]:
         """BM25 over all of the user's facts. Keyword hits the semantic over-fetch
         missed are appended to ``candidates`` (with their true semantic score) so
         an exact-term fact can win even when it is not among the nearest vectors.
+        Respects the same current-truth-only filter as the semantic path (0094)
+        — a superseded fact should not sneak back in via its exact wording.
 
         Reads every fact's text per query — exact and always in sync with the
         store (no side index to maintain), O(facts); fine to ~10^4 per user."""
@@ -506,6 +641,8 @@ class FactEngine:
                 for pid, doc, meta, vec in zip(
                     extra["ids"], extra["documents"], extra["metadatas"], extra["embeddings"]
                 ):
+                    if not _is_current(meta, as_of):
+                        continue
                     # Chroma's default space is squared L2, as in query(); mirror it exactly.
                     dist = sum((a - b) ** 2 for a, b in zip(vec, qvec))
                     candidates.append({

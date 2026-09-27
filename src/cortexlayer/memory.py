@@ -26,13 +26,13 @@ from .types import Answer, AddResult, Page, PageList, SearchResult
 
 DEFAULT_USER_ID = "default"
 DATA_DIR_ENV = "CORTEXLAYER_DATA_DIR"
-MAX_SEARCH_LIMIT = 20
+MAX_SEARCH_LIMIT = 50  # raised from 20 alongside DEFAULT_K (task 0101)
 MAX_LIST_LIMIT = 500
 BACKENDS = ("raw", "facts")
 _CONFIG_KEYS = {
     "backend", "data_dir", "entity_extractor", "spacy_model",
     "default_user_id", "auto_relink", "llm", "embedder", "custom_instructions",
-    "observation_date_from_timestamp", "keyword_scoring",
+    "observation_date_from_timestamp", "keyword_scoring", "supersede",
 }
 
 
@@ -110,6 +110,15 @@ class Memory:
             generic facts with slightly closer vectors. ``True`` (weight 1, as
             Mem0's design; the default) or a float weight; ``False`` is plain
             semantic + entity scoring, identical to Mem0 on a Chroma store.
+        supersede: (``"facts"``, task 0094) when a new fact shares a
+            (subject, predicate) with an existing one still in effect (e.g.
+            "User prefers X" later "User prefers Y"), close the old one's
+            validity window instead of leaving both — :meth:`search`/
+            :meth:`answer` then default to current-truth-only (pass
+            ``as_of`` to see history). ``True`` (default) also asks the
+            extractor for the subject/predicate pair it needs; ``False`` is
+            pure append-only, identical to pre-0094 Cortex (and to Mem0,
+            which has no equivalent).
     """
 
     def __init__(
@@ -126,6 +135,7 @@ class Memory:
         custom_instructions: Optional[str] = None,
         observation_date_from_timestamp: bool = False,
         keyword_scoring: Any = True,
+        supersede: bool = True,
     ) -> None:
         if backend not in BACKENDS:
             raise CortexConfigError(f"backend must be one of {BACKENDS}, got {backend!r}")
@@ -147,6 +157,7 @@ class Memory:
                 self._nlp, custom_instructions=custom_instructions,
                 observation_date_from_timestamp=observation_date_from_timestamp,
                 keyword_weight=float(keyword_scoring),
+                supersede=supersede,
             )
 
     @classmethod
@@ -202,10 +213,13 @@ class Memory:
         entity extraction and the facts pipeline."""
         return self._col(user_id)
 
-    def _passages(self, user_id, col, query: str, limit: int, expand_links: bool) -> List[dict]:
+    def _passages(
+        self, user_id, col, query: str, limit: int, expand_links: bool,
+        as_of: Optional[str] = None,
+    ) -> List[dict]:
         """Seeds (+ optional link expansion) as ``{page_id, text, score, via, ...}``."""
         if self._facts is not None:
-            seeds = self._facts.seeds(self._uid(user_id), query, limit)
+            seeds = self._facts.seeds(self._uid(user_id), query, limit, as_of=as_of)
         else:
             seeds = self._e.storage.query(col, query, n_results=limit)
         if expand_links:
@@ -282,20 +296,29 @@ class Memory:
         query: str,
         *,
         user_id: Optional[str] = None,
-        limit: int = 4,
+        limit: int = 50,  # raised from 4 (task 0101) — see MAX_SEARCH_LIMIT
         expand_links: bool = True,
+        as_of: Optional[str] = None,
     ) -> List[SearchResult]:
         """Semantic search. With ``expand_links`` (default) related pages are
         pulled in via links — those results have ``via == "link"``. An empty
-        store returns ``[]``."""
+        store returns ``[]``.
+
+        ``as_of`` (``backend="facts"`` only, task 0094): retrieve fact
+        history as it stood at that ISO timestamp instead of the current
+        truth — a fact superseded before ``as_of`` stays hidden, one
+        superseded after it (or never) is included. Ignored for
+        ``backend="raw"`` (pages there have no validity window)."""
         need_str(query, "query")
         need_int(limit, "limit", 1, MAX_SEARCH_LIMIT)
         if not isinstance(expand_links, bool):
             raise InvalidRequestError("expand_links must be True or False")
+        if as_of is not None:
+            need_str(as_of, "as_of")
         col = self._col(user_id)
         if col.count() == 0:
             return []
-        passages = self._passages(user_id, col, query, limit, expand_links)
+        passages = self._passages(user_id, col, query, limit, expand_links, as_of=as_of)
         return [self._e.shaping.search_result(p) for p in passages]
 
     def answer(
@@ -303,31 +326,44 @@ class Memory:
         query: str,
         *,
         user_id: Optional[str] = None,
-        limit: int = 4,
+        limit: int = 50,  # raised from 4 (task 0101) — see MAX_SEARCH_LIMIT
         model: Optional[str] = None,
         think: bool = False,
         chat: Optional[Callable[[str, str], str]] = None,
+        llm: Any = None,
+        as_of: Optional[str] = None,
     ) -> Answer:
         """Retrieve, then have an LLM distil a short direct answer plus the ids
         of the pages that support it.
 
         Needs an LLM: by default a local Ollama at ``$OLLAMA_HOST``
         (``http://localhost:11434``). Pass ``chat=fn(prompt, model) -> str`` to
-        use any other model. An unreachable LLM raises (this call has no
-        degraded mode — use :meth:`search` for raw passages).
+        use any other model, or ``llm=`` for a provider spec (task 0099) —
+        ``None``, a dict like ``{"provider": "muse"}``/``{"provider":
+        "deepseek"}``, a callable ``fn(system, user) -> str``, or an object
+        with ``generate()``; same spec as the ``Memory(llm=...)`` extractor
+        config. ``chat`` takes precedence over ``llm`` if both are given. An
+        unreachable LLM raises (this call has no degraded mode — use
+        :meth:`search` for raw passages).
 
         ``think`` (task 0085): let the model reason before answering (~11s vs
         ~0.6s per call) — off by default, under evaluation as a fix for
         reader-miss empty answers on questions needing one small resolution
-        step. Affects this call only, never extraction or linking.
+        step. Affects this call only, never extraction or linking. Ignored
+        when ``llm``/``chat`` is set (local-Ollama-only knob).
+
+        ``as_of`` (``backend="facts"`` only, task 0094): answer from fact
+        history as it stood at that ISO timestamp instead of current truth.
         """
         need_str(query, "query")
         need_int(limit, "limit", 1, MAX_SEARCH_LIMIT)
+        if as_of is not None:
+            need_str(as_of, "as_of")
         col = self._col(user_id)
         if col.count() == 0:
             return Answer(answer="", source_page_ids=[])
-        passages = self._passages(user_id, col, query, limit, True)
-        kwargs: Dict[str, Any] = {"_chat": chat, "think": think}
+        passages = self._passages(user_id, col, query, limit, True, as_of=as_of)
+        kwargs: Dict[str, Any] = {"_chat": chat, "think": think, "llm": llm}
         if model:
             kwargs["model"] = model
         out = self._e.compression.compress(query, passages, **kwargs)

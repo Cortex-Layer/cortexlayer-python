@@ -45,7 +45,7 @@ DEFAULT_BASE_URL = "https://api.cortexlayer.net"
 API_KEY_ENV = "CORTEX_API_KEY"
 BASE_URL_ENV = "CORTEX_BASE_URL"
 
-MAX_SEARCH_LIMIT = 20      # server: top_k 1..20
+MAX_SEARCH_LIMIT = 50      # server: top_k 1..50 (raised from 20, task 0101)
 MAX_LIST_LIMIT = 500       # server: /v1/pages limit 1..500
 USAGE_GROUPS = ("day", "key", "operation")
 _RETRY_STATUS = (502, 503, 504)
@@ -371,10 +371,13 @@ class CortexClient(_Base):
         return self._call(self._op_add(text, timestamp))
 
     def search(
-        self, query: str, *, limit: int = 4, expand_links: bool = True
+        self, query: str, *, limit: int = 50, expand_links: bool = True
     ) -> List[SearchResult]:
         """Semantic search. With ``expand_links`` (default) related pages are
-        pulled in via links — those results have ``via == "link"``."""
+        pulled in via links — those results have ``via == "link"``.
+        ``limit`` default raised 4 -> 50 (task 0101): judged LOCOMO
+        open-domain subset showed a substantial accuracy gain from budget
+        alone, no ranking change."""
         return self._call(self._op_search(query, limit, expand_links))
 
     def get(self, id: str) -> Page:
@@ -484,7 +487,7 @@ class AsyncCortexClient(_Base):
         return await self._call(self._op_add(text, timestamp))
 
     async def search(
-        self, query: str, *, limit: int = 4, expand_links: bool = True
+        self, query: str, *, limit: int = 50, expand_links: bool = True
     ) -> List[SearchResult]:
         return await self._call(self._op_search(query, limit, expand_links))
 

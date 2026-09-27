@@ -244,7 +244,7 @@ def test_default_user_id_and_validation(tmp_path, spacy_nlp):
 
 @pytest.mark.parametrize("call", [
     lambda m: m.add(""), lambda m: m.add(None), lambda m: m.add("x", timestamp=""),
-    lambda m: m.search(""), lambda m: m.search("q", limit=0), lambda m: m.search("q", limit=21),
+    lambda m: m.search(""), lambda m: m.search("q", limit=0), lambda m: m.search("q", limit=51),
     lambda m: m.search("q", limit=True), lambda m: m.search("q", expand_links="yes"),
     lambda m: m.get(""), lambda m: m.update("p", ""), lambda m: m.update("", "x"),
     lambda m: m.delete(""), lambda m: m.get_all(limit=501), lambda m: m.get_all(offset=-1),

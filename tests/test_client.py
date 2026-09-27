@@ -193,7 +193,7 @@ def test_graph_and_neighbors():
     lambda c: c.search(""),
     lambda c: c.search("   "),
     lambda c: c.search("q", limit=0),
-    lambda c: c.search("q", limit=21),
+    lambda c: c.search("q", limit=51),
     lambda c: c.search("q", limit=True),
     lambda c: c.search("q", expand_links="yes"),
     lambda c: c.add(""),

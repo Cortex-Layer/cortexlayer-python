@@ -45,6 +45,38 @@ def test_garbage_response_falls_back_gracefully():
     assert result["source_page_ids"] == ["aaa", "bbb"]
 
 
+def test_llm_spec_routes_through_resolve_llm():
+    """Task 0099: llm= bypasses ollama_chat entirely, going through
+    _engine.llm.resolve_llm instead — proven with a fake generate()."""
+    calls = []
+
+    class FakeLLM:
+        def generate(self, system: str, user: str) -> str:
+            calls.append((system, user))
+            return '{"answer": "1970", "source_page_ids": ["bbb"]}'
+
+    result = compression.compress("When was Nolan born?", PASSAGES, llm=FakeLLM())
+    assert result == {"answer": "1970", "source_page_ids": ["bbb"]}
+    assert len(calls) == 1
+    system, user = calls[0]
+    assert system == ""
+    assert "bbb" in user and "Nolan" in user
+
+
+def test_chat_takes_precedence_over_llm():
+    """_chat (test injection) wins even when llm= is also passed."""
+    chat = _stub_chat('{"answer": "chat wins", "source_page_ids": []}')
+
+    class ExplodingLLM:
+        def generate(self, system: str, user: str) -> str:
+            raise AssertionError("llm.generate should not be called when _chat is set")
+
+    result = compression.compress(
+        "When was Nolan born?", PASSAGES, llm=ExplodingLLM(), _chat=chat
+    )
+    assert result["answer"] == "chat wins"
+
+
 def test_live_ollama_call():
     """End-to-end against local Ollama. Skipped when the server is down."""
     try:
