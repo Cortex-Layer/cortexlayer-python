@@ -45,6 +45,26 @@ def test_garbage_response_falls_back_gracefully():
     assert result["source_page_ids"] == ["aaa", "bbb"]
 
 
+def test_build_prompt_includes_anti_hedge_instruction():
+    """Task 0102: no "not specified" / "cannot be determined" style non-answers
+    when the passages contain any relevant information."""
+    prompt = compression.build_prompt("When was Nolan born?", PASSAGES)
+    assert "NEVER hedge" in prompt
+    assert "not specified" in prompt
+    assert "cannot be determined" in prompt
+    assert "Commit to the single best-supported answer" in prompt
+
+
+def test_build_prompt_includes_causal_reasoning_template():
+    """Task 0102: mem0-inspired counterfactual/causal template for
+    judgment-style questions ("would X still do Y if Z hadn't happened")."""
+    prompt = compression.build_prompt("When was Nolan born?", PASSAGES)
+    assert "reason step by step" in prompt
+    assert "likely yes" in prompt
+    assert "likely no" in prompt
+    assert "because of" in prompt
+
+
 def test_llm_spec_routes_through_resolve_llm():
     """Task 0099: llm= bypasses ollama_chat entirely, going through
     _engine.llm.resolve_llm instead — proven with a fake generate()."""
