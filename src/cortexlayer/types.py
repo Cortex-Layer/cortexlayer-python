@@ -18,6 +18,11 @@ def _list(d: Dict[str, Any], key: str) -> List[str]:
     return [x for x in v if isinstance(x, str)] if isinstance(v, list) else []
 
 
+def _dict(d: Dict[str, Any], key: str) -> Dict[str, Any]:
+    v = d.get(key)
+    return v if isinstance(v, dict) else {}
+
+
 @dataclass(frozen=True)
 class SearchResult:
     """One hit from :meth:`CortexClient.search`.
@@ -30,6 +35,10 @@ class SearchResult:
     semantics depend on the backend (a distance, lower = closer, on raw; the
     fused semantic + keyword + entity score, higher = closer, on facts) —
     compare within one store or server, not across.
+
+    ``tags`` (task 0090) is whatever provenance metadata was passed to
+    ``Memory.add(tags=...)`` when this page was written (``{}`` if none) —
+    informational only, never a filter.
     """
 
     id: str
@@ -40,6 +49,7 @@ class SearchResult:
     linked_from: Optional[str] = None
     source: str = "private"
     text: str = ""   # the full memory text (local ``Memory`` fills it; a server may omit it)
+    tags: Dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "SearchResult":
@@ -53,12 +63,18 @@ class SearchResult:
             linked_from=lf if isinstance(lf, str) else None,
             source=_s(d, "source", "private"),
             text=_s(d, "text"),
+            tags=_dict(d, "tags"),
         )
 
 
 @dataclass(frozen=True)
 class Page:
-    """A stored memory page. ``links`` point out, ``linked_from`` point in."""
+    """A stored memory page. ``links`` point out, ``linked_from`` point in.
+
+    ``tags`` (task 0090) is whatever provenance metadata was passed to
+    ``Memory.add(tags=...)`` when this page was written (``{}`` if none) —
+    informational only, never a filter.
+    """
 
     id: str
     title: str
@@ -68,6 +84,7 @@ class Page:
     linked_from: List[str] = field(default_factory=list)
     degree: int = 0
     created_at: str = ""
+    tags: Dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "Page":
@@ -80,6 +97,7 @@ class Page:
             linked_from=_list(d, "linked_from"),
             degree=int(d.get("degree") or 0),
             created_at=_s(d, "created_at"),
+            tags=_dict(d, "tags"),
         )
 
 

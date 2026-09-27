@@ -122,6 +122,61 @@ def test_delete_leaves_no_dangling_links_after_relink(mem):
     assert mem.get(survivor.id).degree == 0
 
 
+# --- tags (provenance metadata, task 0090) ---------------------------------------
+
+
+def test_add_with_tags_round_trips_through_get_search_and_get_all(mem):
+    tagged = {"agent_id": "planner", "session_id": "abc123", "priority": 2, "verified": True}
+    pid = mem.add("Alice moved to Lisbon in March.", tags=tagged).page_ids[0]
+
+    assert mem.get(pid).tags == tagged
+    assert mem.search("Alice Lisbon")[0].tags == tagged
+    page = next(p for p in mem.get_all().pages if p.id == pid)
+    assert page.tags == tagged
+
+
+def test_omitting_tags_behaves_exactly_as_today(mem):
+    pid = mem.add("Bob likes tea.").page_ids[0]
+    assert mem.get(pid).tags == {}
+    assert mem.search("Bob tea")[0].tags == {}
+    assert mem.get_all().pages[0].tags == {}
+
+
+def test_tags_are_provenance_not_a_filter(mem):
+    """No tag-based filtering exists anywhere — search/get_all keep spanning
+    the whole collection whether or not a page (or the query) mentions tags."""
+    a = mem.add("Carol wrote a report.", tags={"source": "agent-a"}).page_ids[0]
+    b = mem.add("Carol wrote another report.").page_ids[0]  # no tags at all
+
+    ids = {p.id for p in mem.get_all().pages}
+    assert ids == {a, b}
+    hits = {h.id for h in mem.search("Carol report", limit=2)}
+    assert hits == {a, b}
+
+
+def test_tags_are_carried_through_link_expansion(mem):
+    _seed(mem, tags={"source": "import"})
+    mem.relink()
+    hits = mem.search("Who directed Inception?", limit=1)
+    assert [h.via for h in hits] == ["direct", "link"]
+    assert hits[0].tags == {"source": "import"} and hits[1].tags == {"source": "import"}
+
+
+def test_bad_tags_raise_invalid_request(mem):
+    for bad in (
+        "nope", 1, ["a"],
+        {1: "int key"}, {"": "empty key"},
+        {"nested": {"a": 1}}, {"list": [1, 2]}, {"none": None},
+    ):
+        with pytest.raises(InvalidRequestError):
+            mem.add("x", tags=bad)
+
+
+def test_empty_tags_dict_is_treated_like_no_tags(mem):
+    pid = mem.add("x", tags={}).page_ids[0]
+    assert mem.get(pid).tags == {}
+
+
 # --- browse ---------------------------------------------------------------------
 
 

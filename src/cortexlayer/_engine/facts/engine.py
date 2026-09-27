@@ -215,12 +215,28 @@ class FactEngine:
         except Exception as e:  # noqa: BLE001 — provider errors of any kind
             raise LLMError(f"embedding failed: {e}") from e
 
+    def embed_query(self, query: str) -> List[float]:
+        """A query's vector in this store's embedding space (task 0077: lets
+        link-expansion rank a seed's neighbors by relevance to the query —
+        facts collections hold vectors from this custom embedder, not
+        Chroma's default text function, so ranking needs the matching vector)."""
+        return self._embed([query], "search")[0]
+
     # --- add ---
 
-    def add(self, user_id: str, text: str, timestamp: Optional[str] = None) -> List[Dict[str, str]]:
+    def add(
+        self,
+        user_id: str,
+        text: str,
+        timestamp: Optional[str] = None,
+        tags: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, str]]:
         """Extract facts from ``text`` and store them. Returns ``[{"id", "text"}]``
         (empty if nothing was worth remembering). Raises :class:`LLMError` if the
-        model or embedder is unreachable — that is not "no facts"."""
+        model or embedder is unreachable — that is not "no facts".
+
+        ``tags`` (task 0090): optional provenance metadata, stamped as-is onto
+        every fact extracted from this one call (via ``storage.insert_page``)."""
         if timestamp:
             text = ingestion.apply_timestamp(text, timestamp)
         messages = [{"role": "user", "content": text}]
@@ -302,7 +318,7 @@ class FactEngine:
         for rec in records:
             pid = storage.insert_page(
                 facts, rec["text"], self._nlp.entities(rec["text"]),
-                created_at=stamp, embedding=rec["vector"], extra=rec["extra"],
+                created_at=stamp, embedding=rec["vector"], extra=rec["extra"], tags=tags,
             )
             rec["id"] = pid
             out.append({"id": pid, "text": rec["text"]})
@@ -381,7 +397,7 @@ class FactEngine:
         or embedder call — used to move a Mem0 store into this engine.
 
         ``facts``: ``{"id", "text", "vector", "created_at"?, "updated_at"?,
-        "hash"?, "attributed_to"?}``. ``entities``: ``{"id", "text", "type",
+        "hash"?, "attributed_to"?, "tags"?}``. ``entities``: ``{"id", "text", "type",
         "vector", "linked_memory_ids"}``. Ids are preserved, so links between
         the two survive. Idempotent: ids already present are skipped. The
         vectors must come from the embedder this engine is configured with —
@@ -404,6 +420,7 @@ class FactEngine:
             storage.insert_page(
                 col, text, self._nlp.entities(text), page_id=f["id"],
                 created_at=f.get("created_at"), embedding=list(f["vector"]), extra=extra,
+                tags=f.get("tags"),
             )
             added += 1
         stored = have | {f["id"] for f in facts}
@@ -444,7 +461,7 @@ class FactEngine:
         query_entities = (
             entity_extraction.extract_entities(query, nlp=self._spacy) if self._spacy else []
         )
-        qvec = self._embed([query], "search")[0]
+        qvec = self.embed_query(query)
         res = facts.query(
             query_embeddings=[qvec], n_results=min(max(limit * 4, 60), total),
             include=["documents", "metadatas", "distances"],

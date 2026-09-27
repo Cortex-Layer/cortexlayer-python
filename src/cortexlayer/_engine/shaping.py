@@ -38,6 +38,7 @@ def search_result(passage: dict) -> SearchResult:
         linked_from=linked if isinstance(linked, str) else None,
         source="private",
         text=text,
+        tags=passage.get("tags") or {},
     )
 
 
@@ -93,4 +94,5 @@ def page(
         linked_from=back,
         degree=len(set(links) | set(back)),
         created_at=stored.get("created_at", "") or "",
+        tags=stored.get("tags") or {},
     )

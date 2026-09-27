@@ -144,6 +144,21 @@ def test_add_extracts_and_stores_facts_with_metadata(eng):
     assert meta["attributed_to"] == "user" and meta["updated_at"]
 
 
+def test_add_with_tags_stamps_every_extracted_fact(eng):
+    """Task 0090: caller-supplied tags must not clobber, and must not be
+    clobbered by, the engine's own extra metadata (hash/updated_at/attributed_to)."""
+    out = eng.add(
+        "u", "Caroline adopted a dog named Max. Melanie visited Paris.",
+        tags={"agent_id": "planner"},
+    )
+    col = eng.collection("u")
+    for f in out:
+        page = storage.get_page(col, f["id"])
+        assert page["tags"] == {"agent_id": "planner"}
+        meta = col.get(ids=[f["id"]], include=["metadatas"])["metadatas"][0]
+        assert meta["attributed_to"] == "user" and meta["hash"]         # untouched by tags
+
+
 def test_timestamp_is_prefixed_and_stored(eng, llm):
     out = eng.add("u", "Caroline adopted a dog named Max.", timestamp="8 May, 2023")
     assert out[0]["text"].startswith("[8 May, 2023]")
@@ -327,6 +342,12 @@ def test_update_reembeds_and_refreshes_hash(eng):
     assert eng.seeds("u", "Serengeti zebra", 1)[0]["id"] == pid
 
 
+def test_update_preserves_tags(eng):
+    pid = eng.add("u", "Caroline adopted a dog named Max.", tags={"source": "hermes"})[0]["id"]
+    eng.update("u", pid, "Caroline adopted a cat named Max.")
+    assert storage.get_page(eng.collection("u"), pid)["tags"] == {"source": "hermes"}
+
+
 def test_users_are_isolated_including_context_and_entities(eng, llm):
     eng.add("alice", "Caroline adopted a dog named Max.")
     eng.add("bob", "Melanie visited Paris.")
@@ -466,6 +487,12 @@ def test_memory_facts_round_trip(fmem, llm):
     assert fmem.delete_all(user_id="u") == 1 and fmem.count(user_id="u") == 0
     fmem.add("Melanie visited Paris.", user_id="u")                    # usable again after delete_all
     assert fmem.count(user_id="u") == 1
+
+
+def test_memory_facts_tags_round_trip_through_get_and_search(fmem):
+    ids = fmem.add("Caroline adopted a dog named Max.", user_id="u", tags={"source": "hermes"}).page_ids
+    assert fmem.get(ids[0], user_id="u").tags == {"source": "hermes"}
+    assert fmem.search("dog Max", user_id="u")[0].tags == {"source": "hermes"}
 
 
 def test_memory_facts_answer_uses_the_fact_seeds(fmem):

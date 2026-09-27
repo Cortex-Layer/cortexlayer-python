@@ -11,7 +11,7 @@ Ingestion never runs the linking pass — linking stays a batch operation.
 from __future__ import annotations
 
 import re
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from chromadb.api.models.Collection import Collection
 
@@ -68,17 +68,20 @@ def add_text(
     text: str,
     nlp: NLP,
     timestamp: Optional[str] = None,
+    tags: Optional[Dict[str, Any]] = None,
 ) -> List[str]:
     """Chunk → entities → insert. Returns the new page ids.
 
     ``timestamp`` (e.g. ``"8 May, 2023"``) is prefixed to undated lines and
-    stored as each page's ``created_at``.
+    stored as each page's ``created_at``. ``tags`` (task 0090) is optional
+    provenance metadata stored on every resulting page unchanged — see
+    ``storage.insert_page``.
     """
     if timestamp:
         text = apply_timestamp(text, timestamp)
     return [
         storage.insert_page(
-            collection, chunk, nlp.entities(chunk), created_at=timestamp or None
+            collection, chunk, nlp.entities(chunk), created_at=timestamp or None, tags=tags
         )
         for chunk in chunk_text(text, nlp)
     ]

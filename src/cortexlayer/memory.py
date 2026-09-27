@@ -20,7 +20,7 @@ import os
 import threading
 from typing import Any, Callable, Dict, List, Optional
 
-from ._validate import need_int, need_str
+from ._validate import need_int, need_str, need_tags
 from .errors import CortexConfigError, InvalidRequestError, LocalDependencyError, NotFoundError
 from .types import Answer, AddResult, Page, PageList, SearchResult
 
@@ -206,9 +206,17 @@ class Memory:
         else:
             seeds = self._e.storage.query(col, query, n_results=limit)
         if expand_links:
-            return self._e.retrieval.expand_links(col, seeds)
+            if self._facts is not None:
+                # Facts collections hold vectors from the configured embedder,
+                # not Chroma's default text function — rank with a matching
+                # query vector (task 0077).
+                return self._e.retrieval.expand_links(
+                    col, seeds, query_embedding=self._facts.embed_query(query)
+                )
+            return self._e.retrieval.expand_links(col, seeds, query=query)
         return [
-            {"page_id": p["id"], "text": p["text"], "score": p.get("score", 0.0), "via": "direct"}
+            {"page_id": p["id"], "text": p["text"], "score": p.get("score", 0.0),
+             "via": "direct", "tags": p.get("tags")}
             for p in seeds
         ]
 
@@ -223,18 +231,32 @@ class Memory:
         *,
         user_id: Optional[str] = None,
         timestamp: Optional[str] = None,
+        tags: Optional[Dict[str, Any]] = None,
     ) -> AddResult:
         """Save ``text`` as memory. Long text is chunked into several small
         pages (one fact each works best). ``timestamp`` (e.g. ``"8 May, 2023"``)
-        is stored as the date. Does not relink unless ``auto_relink`` is on."""
+        is stored as the date.
+
+        ``tags`` (task 0090) is optional provenance metadata — a flat dict of
+        str/int/float/bool values, e.g. ``{"agent_id": "planner", "session_id":
+        "abc123"}`` — stamped onto every page this call creates and returned
+        as-is on :meth:`get`/:meth:`get_all`/:meth:`search`. It is deliberately
+        **not** a scoping or isolation mechanism: ``search``/``answer``/
+        ``get_all`` keep spanning this user's whole collection by default,
+        exactly as without ``tags``. It exists so several agents/sessions can
+        share one person's memory (the "hive mind") while still recording,
+        for later inspection, which one wrote a given fact.
+
+        Does not relink unless ``auto_relink`` is on."""
         need_str(text, "text")
         if timestamp is not None:
             need_str(timestamp, "timestamp")
+        tags = need_tags(tags, "tags")
         col = self._col(user_id)
         if self._facts is not None:
-            ids = [f["id"] for f in self._facts.add(self._uid(user_id), text, timestamp)]
+            ids = [f["id"] for f in self._facts.add(self._uid(user_id), text, timestamp, tags)]
         else:
-            ids = self._e.ingestion.add_text(col, text, self._nlp, timestamp=timestamp)
+            ids = self._e.ingestion.add_text(col, text, self._nlp, timestamp=timestamp, tags=tags)
         if self._auto_relink and ids:
             self._e.linking.run_linking_pass(col)
         return AddResult(page_ids=ids)
@@ -267,6 +289,7 @@ class Memory:
         user_id: Optional[str] = None,
         limit: int = 4,
         model: Optional[str] = None,
+        think: bool = False,
         chat: Optional[Callable[[str, str], str]] = None,
     ) -> Answer:
         """Retrieve, then have an LLM distil a short direct answer plus the ids
@@ -276,6 +299,11 @@ class Memory:
         (``http://localhost:11434``). Pass ``chat=fn(prompt, model) -> str`` to
         use any other model. An unreachable LLM raises (this call has no
         degraded mode — use :meth:`search` for raw passages).
+
+        ``think`` (task 0085): let the model reason before answering (~11s vs
+        ~0.6s per call) — off by default, under evaluation as a fix for
+        reader-miss empty answers on questions needing one small resolution
+        step. Affects this call only, never extraction or linking.
         """
         need_str(query, "query")
         need_int(limit, "limit", 1, MAX_SEARCH_LIMIT)
@@ -283,7 +311,7 @@ class Memory:
         if col.count() == 0:
             return Answer(answer="", source_page_ids=[])
         passages = self._passages(user_id, col, query, limit, True)
-        kwargs: Dict[str, Any] = {"_chat": chat}
+        kwargs: Dict[str, Any] = {"_chat": chat, "think": think}
         if model:
             kwargs["model"] = model
         out = self._e.compression.compress(query, passages, **kwargs)

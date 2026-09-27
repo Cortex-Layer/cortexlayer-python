@@ -160,7 +160,7 @@ m.search("Who directed Inception?", user_id="alice", limit=1)
 
 | `Memory` method | Returns |
 |---|---|
-| `add(text, user_id=, timestamp=)` | `AddResult` (long text is chunked into several pages) |
+| `add(text, user_id=, timestamp=, tags=)` | `AddResult` (long text is chunked into several pages) |
 | `search(query, user_id=, limit=4, expand_links=True)` | `list[SearchResult]` |
 | `get(id)` / `get_all(query=, limit=, offset=)` | `Page` / `PageList` |
 | `update(id, text)` / `delete(id)` / `delete_all(user_id=)` | `None` / `None` / count removed |
@@ -170,6 +170,11 @@ m.search("Who directed Inception?", user_id="alice", limit=1)
 `Memory.from_config({...})` builds one from a dict (`data_dir`, `entity_extractor`, `spacy_model`,
 `default_user_id`, `auto_relink`, `backend`, `llm`, `embedder`, `custom_instructions`,
 `observation_date_from_timestamp`, `keyword_scoring`).
+
+`add(..., tags={"agent_id": "planner"})` stamps optional provenance metadata (a flat dict of
+str/int/float/bool values) onto the resulting page(s); it comes back on `get`/`get_all`/`search` but is
+never a filter — every call still searches the user's whole store by default. Useful when several
+agents or sessions share one person's memory and you want to know later which one wrote what.
 
 ### Fact memory: `Memory(backend="facts")`
 

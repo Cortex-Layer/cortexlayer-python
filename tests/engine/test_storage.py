@@ -22,6 +22,30 @@ def test_insert_get_round_trip(tmp_path):
     assert page["created_at"]
 
 
+def test_insert_get_round_trip_with_tags(tmp_path):
+    col = _fresh_collection(tmp_path)
+    pid = storage.insert_page(
+        col, "Note.", ["Note"], tags={"agent_id": "planner", "n": 3, "ok": True}
+    )
+    page = storage.get_page(col, pid)
+    assert page["tags"] == {"agent_id": "planner", "n": 3, "ok": True}
+
+
+def test_tags_default_to_empty_dict_when_omitted_or_empty(tmp_path):
+    col = _fresh_collection(tmp_path)
+    a = storage.insert_page(col, "No tags.", [])
+    b = storage.insert_page(col, "Empty tags.", [], tags={})
+    assert storage.get_page(col, a)["tags"] == {}
+    assert storage.get_page(col, b)["tags"] == {}
+
+
+def test_text_update_preserves_tags(tmp_path):
+    col = _fresh_collection(tmp_path)
+    pid = storage.insert_page(col, "Old text.", ["Entity"], tags={"source": "import"})
+    storage.update_page_text(col, pid, "New text.")
+    assert storage.get_page(col, pid)["tags"] == {"source": "import"}
+
+
 def test_links_update_and_append(tmp_path):
     col = _fresh_collection(tmp_path)
     a = storage.insert_page(col, "Page A about Nolan.", ["Nolan"])

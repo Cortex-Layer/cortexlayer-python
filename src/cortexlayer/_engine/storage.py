@@ -7,10 +7,20 @@ Schema per entry:
     entities    metadata  list of extracted entities/key terms
     links       metadata  list of linked page IDs (populated by the linking pass)
     created_at  metadata  ISO-8601 timestamp
+    tags        metadata  optional dict of page-level provenance (task 0090), e.g.
+                          agent_id/source/session_id — JSON-encoded, decoded back to
+                          a dict by this module. Deliberately NOT an isolation
+                          mechanism: every query still spans the whole per-user
+                          collection by default; a tag just rides along as metadata
+                          you can look at (or opt-in filter on) later. Per-user
+                          isolation is (and stays) via separate Chroma collections
+                          (task 0026) — no default filter here means no
+                          forgotten-filter failure mode either.
 
 Implementation note: Chroma metadata values must be scalars (str/int/float/bool),
-so ``entities`` and ``links`` are stored as JSON-encoded strings and transparently
-decoded by this module. Callers always work with plain Python lists.
+so ``entities``, ``links`` and ``tags`` are stored as JSON-encoded strings and
+transparently decoded by this module. Callers always work with plain Python lists
+/ dicts.
 
 Multi-user isolation: the raw backend keeps one Chroma collection per user in
 the shared persist dir. ``get_collection`` takes a
@@ -101,6 +111,22 @@ def _decode_list(raw: str | None) -> list[str]:
     return [str(v) for v in decoded] if isinstance(decoded, list) else []
 
 
+def _encode_tags(tags: dict | None) -> str | None:
+    """``None``/``{}`` -> ``None`` (no key written at all — identical to a
+    store that predates task 0090, no schema migration needed)."""
+    return json.dumps(tags) if tags else None
+
+
+def _decode_tags(raw: str | None) -> dict:
+    if not raw:
+        return {}
+    try:
+        decoded = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return {}
+    return decoded if isinstance(decoded, dict) else {}
+
+
 def get_client(persist_dir: str = DEFAULT_PERSIST_DIR) -> chromadb.PersistentClient:
     """Open (creating if needed) the persistent embedded Chroma client.
 
@@ -146,6 +172,7 @@ def _page_from_result(
         "entities": _decode_list(metadata.get("entities")),
         "links": _decode_list(metadata.get("links")),
         "created_at": metadata.get("created_at", ""),
+        "tags": _decode_tags(metadata.get("tags")),
     }
 
 
@@ -157,19 +184,28 @@ def insert_page(
     created_at: str | None = None,
     embedding: list[float] | None = None,
     extra: dict | None = None,
+    tags: dict | None = None,
 ) -> str:
     """Insert one page into the caller's user-scoped collection. Returns the page ID.
 
     IDs are uuid4 hex (globally unique); the same hex in two users'
     collections denotes different pages, and a leaked cross-user ID fails
     closed on ``get_page`` (returns None — the ID is absent in your store).
-    ``links`` starts empty until the per-user linking pass runs."""
+    ``links`` starts empty until the per-user linking pass runs.
+
+    ``tags`` (task 0090) is optional page-level provenance metadata (e.g.
+    ``{"agent_id": "planner"}``) — kept separate from ``extra``, which is a
+    raw passthrough callers use for their own scalar metadata (e.g. the facts
+    engine's ``hash``/``updated_at``/``attributed_to``), so the two can never
+    clobber each other. Reserved keys (``entities``/``links``/``created_at``/
+    ``tags``) always win over anything of the same name in ``extra``."""
     pid = page_id or new_page_id()
     kwargs: dict = {}
     if embedding is not None:
         # Caller-supplied vector (fact memory embeds with its own model);
         # without it Chroma embeds the document with its default function.
         kwargs["embeddings"] = [embedding]
+    encoded_tags = _encode_tags(tags)
     collection.add(
         ids=[pid],
         documents=[text],
@@ -179,6 +215,7 @@ def insert_page(
                 "entities": _encode_list(entities),
                 "links": _encode_list([]),
                 "created_at": created_at or utc_now_iso(),
+                **({"tags": encoded_tags} if encoded_tags else {}),
             }
         ],
         **kwargs,
