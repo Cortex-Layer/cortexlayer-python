@@ -87,6 +87,47 @@ def test_provenance_marks_direct_vs_link(tmp_path):
     assert linked["linked_from"] == seed["id"]
 
 
+def test_expansion_ranks_by_relevance_not_arbitrary_id_order(tmp_path):
+    """0077: expansion used to take ``seed["links"][0]`` — links are stored
+    sorted by page id (uuid4 hex), so the pick was arbitrary, not the most
+    relevant neighbor. Give the irrelevant neighbor the alphabetically-first
+    id (the old code would have picked it) and confirm ranking beats id order."""
+    col = _fresh_collection(tmp_path)
+    ingestion.ingest_text(col, "The director of Inception is Christopher Nolan.")
+    storage.insert_page(
+        col, "Christopher Nolan directed Dunkirk in 2017.",
+        ["Christopher Nolan"], page_id="a" * 32,
+    )
+    storage.insert_page(
+        col, "Christopher Nolan was born on July 30, 1970.",
+        ["Christopher Nolan"], page_id="z" * 32,
+    )
+    linking.run_linking_pass(col)
+    passages = retrieval.retrieve(col, "When was the director of Inception born?", k=1)
+    linked_texts = [p["text"] for p in passages if p["via"] == "link"]
+    assert linked_texts == ["Christopher Nolan was born on July 30, 1970."]
+
+
+def test_expansion_without_query_falls_back_to_id_order(tmp_path):
+    """expand_links(query=None) keeps the old (arbitrary but deterministic)
+    id-sorted pick — callers that don't have a query still work."""
+    col = _fresh_collection(tmp_path)
+    seed_id = ingestion.ingest_text(col, "The director of Inception is Christopher Nolan.")[0]
+    storage.insert_page(
+        col, "Christopher Nolan directed Dunkirk in 2017.",
+        ["Christopher Nolan"], page_id="a" * 32,
+    )
+    storage.insert_page(
+        col, "Christopher Nolan was born on July 30, 1970.",
+        ["Christopher Nolan"], page_id="z" * 32,
+    )
+    linking.run_linking_pass(col)
+    seed = storage.get_page(col, seed_id)
+    passages = retrieval.expand_links(col, [{**seed, "score": 0.0}])
+    linked_texts = [p["text"] for p in passages if p["via"] == "link"]
+    assert linked_texts == ["Christopher Nolan directed Dunkirk in 2017."]
+
+
 def test_provenance_dedupe_keeps_direct(tmp_path):
     """A page that is both seed and expansion stays via=direct."""
     col = _fresh_collection(tmp_path)

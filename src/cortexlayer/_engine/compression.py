@@ -27,6 +27,10 @@ def build_prompt(query: str, passages: list[dict]) -> str:
     )
     return (
         "Answer the question using ONLY the passages below. Be concise and direct.\n"
+        "Passage lines may start with a timestamp, e.g. \"[3 July, 2023] Name: ...\". If "
+        "the answer involves a relative time word (yesterday, today, last week, this "
+        "month, etc.), resolve it to an absolute date using that line's timestamp — "
+        "answer with the resolved date, never the relative word itself.\n"
         "Reply with a single JSON object: "
         '{"answer": "<short direct answer>", '
         '"source_page_ids": ["<page_id that supports the answer>", ...]}.\n'
@@ -36,8 +40,31 @@ def build_prompt(query: str, passages: list[dict]) -> str:
     )
 
 
-def ollama_chat(prompt: str, model: str = DEFAULT_MODEL) -> str:
-    """Single non-streaming chat call. Returns the raw response content."""
+def ollama_chat(
+    prompt: str,
+    model: str = DEFAULT_MODEL,
+    num_ctx: int | None = None,
+    think: bool = False,
+) -> str:
+    """Single non-streaming chat call. Returns the raw response content.
+
+    ``num_ctx`` overrides the model's runtime context window (Ollama reloads
+    the model if this differs from what's currently resident). Needed for the
+    full-context benchmark arm, where a whole conversation transcript can
+    exceed the default 32768-token window — see run_locomo.py --backend
+    full_context.
+
+    ``think`` (task 0085, falsifiability test in progress): thinking models
+    (e.g. qwen3.5) otherwise spend hundreds of hidden reasoning tokens on a
+    one-line answer (~11s vs ~0.6s measured) — hence the default off. Under
+    investigation as a fix for reader-miss empty answers on questions needing
+    one small resolution step (relative-date math, cross-referencing two
+    adjacent facts). Exposed as a parameter (not hardcoded) so the benchmark
+    harness can A/B it before any default changes.
+    """
+    options = {"temperature": 0}
+    if num_ctx is not None:
+        options["num_ctx"] = num_ctx
     with httpx.Client(base_url=OLLAMA_HOST, timeout=120.0) as client:
         response = client.post(
             "/api/chat",
@@ -46,10 +73,8 @@ def ollama_chat(prompt: str, model: str = DEFAULT_MODEL) -> str:
                 "messages": [{"role": "user", "content": prompt}],
                 "stream": False,
                 "format": "json",
-                # Thinking models (e.g. qwen3.5) otherwise spend hundreds of hidden
-                # reasoning tokens on a one-line answer (~11 s vs ~0.6 s measured).
-                "think": False,
-                "options": {"temperature": 0},
+                "think": think,
+                "options": options,
             },
         )
         response.raise_for_status()
@@ -73,13 +98,16 @@ def compress(
     passages: list[dict],
     model: str = DEFAULT_MODEL,
     include_passage: bool = False,
+    num_ctx: int | None = None,
+    think: bool = False,
     _chat: Callable[[str, str], str] | None = None,
 ) -> dict:
     """Compress passages into {answer, source_page_ids, [source_passage]}.
 
+    ``think`` (task 0085): see :func:`ollama_chat`.
     ``_chat`` is injectable for tests (defaults to a live Ollama call).
     """
-    chat = _chat or ollama_chat
+    chat = _chat or (lambda p, m: ollama_chat(p, m, num_ctx=num_ctx, think=think))
     page_ids = [p["page_id"] for p in passages]
     result = parse_response(chat(build_prompt(query, passages), model), page_ids)
     if include_passage:
