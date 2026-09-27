@@ -87,6 +87,19 @@ def test_provenance_marks_direct_vs_link(tmp_path):
     assert linked["linked_from"] == seed["id"]
 
 
+def test_linked_score_is_a_real_distance_not_zero(tmp_path):
+    """Regression for the 2026-09-26 bug: link-expansion rows always reported
+    score=0.0 because _rank_neighbors computed real distances via its own
+    ranking query but only returned ids, and expand_links then re-fetched
+    the page with storage.get_page (a plain Chroma `get`, which never
+    carries distances) and fell back to the 0.0 default."""
+    col = _fresh_collection(tmp_path)
+    _seed_two_hop(col)
+    passages = retrieval.retrieve(col, "Who directed Inception?", k=1)
+    linked = [p for p in passages if p["via"] == "link"][0]
+    assert linked["score"] != 0.0
+
+
 def test_expansion_ranks_by_relevance_not_arbitrary_id_order(tmp_path):
     """0077: expansion used to take ``seed["links"][0]`` — links are stored
     sorted by page id (uuid4 hex), so the pick was arbitrary, not the most
