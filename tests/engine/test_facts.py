@@ -475,6 +475,12 @@ def test_memory_facts_round_trip(fmem, llm):
     hits = fmem.search("Who directed Inception?", user_id="u", limit=1)
     assert [h.via for h in hits] == ["direct", "link"] and hits[1].linked_from == hits[0].id
     assert 0 < hits[0].score <= 1
+    # Regression (found 2026-09-26 testing the Playground): the link hit's
+    # score used to be a raw, unconverted Chroma distance (unbounded, and on
+    # the opposite "lower is better" scale from the seed's fused [0, 1]
+    # similarity) because expand_links() doesn't know this backend fuses and
+    # rescales its seed scores. Same range check as the seed above.
+    assert 0 < hits[1].score <= 1
     assert [h.via for h in fmem.search("Who directed Inception?", user_id="u", limit=1, expand_links=False)] == ["direct"]
     page = fmem.get(hits[0].id, user_id="u")
     assert page.degree == 1 and page.content == "Christopher Nolan directed Inception."

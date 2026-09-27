@@ -49,6 +49,7 @@ def _load_engine(backend: str = "raw") -> Any:
         if backend == "facts":
             from ._engine.facts import backends as fact_backends
             from ._engine.facts import engine as fact_engine
+            from ._engine.facts import scoring as fact_scoring
     except ImportError as e:
         raise LocalDependencyError(
             "The embedded engine needs extra packages. Run: "
@@ -63,7 +64,9 @@ def _load_engine(backend: str = "raw") -> Any:
     for mod in (compression, ingestion, linking, nlp, retrieval, shaping, storage):
         setattr(eng, mod.__name__.rsplit(".", 1)[-1], mod)
     if backend == "facts":
-        eng.fact_backends, eng.fact_engine = fact_backends, fact_engine
+        eng.fact_backends, eng.fact_engine, eng.fact_scoring = (
+            fact_backends, fact_engine, fact_scoring,
+        )
     return eng
 
 
@@ -210,9 +213,22 @@ class Memory:
                 # Facts collections hold vectors from the configured embedder,
                 # not Chroma's default text function — rank with a matching
                 # query vector (task 0077).
-                return self._e.retrieval.expand_links(
+                passages = self._e.retrieval.expand_links(
                     col, seeds, query_embedding=self._facts.embed_query(query)
                 )
+                # expand_links's score is always a raw Chroma distance
+                # (lower=better, unbounded) — right for the raw backend, but
+                # seeds() above already fused this backend's score into a
+                # [0, 1] similarity where *higher* is better (semantic +
+                # keyword + entity boost). Left unconverted, link rows landed
+                # on a different scale and direction than seeds (found
+                # 2026-09-26 testing the Playground: linked results looked
+                # unsorted relative to direct ones). Put link rows on the
+                # same scale so score is comparable across the whole result.
+                for p in passages:
+                    if p["via"] == "link":
+                        p["score"] = self._e.fact_scoring.distance_to_score(p["score"])
+                return passages
             return self._e.retrieval.expand_links(col, seeds, query=query)
         return [
             {"page_id": p["id"], "text": p["text"], "score": p.get("score", 0.0),
