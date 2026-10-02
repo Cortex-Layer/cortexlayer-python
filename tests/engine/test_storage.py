@@ -1,6 +1,8 @@
 """Ported verbatim from the Cortex backend suite (test_storage.py) — proves the copied engine
 behaves identically. Only the imports changed."""
 
+import pytest
+
 from cortexlayer._engine import storage
 
 
@@ -124,9 +126,70 @@ def test_per_user_collections_are_isolated(tmp_path):
 
 
 def test_user_id_validation_rejects_bad_input(tmp_path):
-    import pytest
-
     client = _fresh_client(tmp_path)
     for bad in ["", "has space", "a/b", "..", "trail-", "semi;colon", "x" * 65, None]:
         with pytest.raises((ValueError, TypeError)):
             storage.get_collection(client, bad)
+
+
+# --- org collections (task 0107, arch §9.2) ---
+
+ORG_A = "11111111111111111111111111111111"
+ORG_B = "22222222222222222222222222222222"
+
+
+def test_collection_name_for_org(tmp_path):
+    assert storage.collection_name_for_org(ORG_A) == f"cortex_org_pages__{ORG_A}"
+
+
+def test_org_id_validation_rejects_bad_input(tmp_path):
+    client = _fresh_client(tmp_path)
+    for bad in ["", "not-hex!!", "x" * 31, "x" * 33, "ABCDEF00" * 4, None, 123]:
+        with pytest.raises((ValueError, TypeError)):
+            storage.get_org_collection(client, bad)
+
+
+def test_org_collections_are_isolated_from_each_other(tmp_path):
+    client = _fresh_client(tmp_path)
+    org_a = storage.get_org_collection(client, ORG_A)
+    org_b = storage.get_org_collection(client, ORG_B)
+    assert org_a.name == f"cortex_org_pages__{ORG_A}"
+    assert org_b.name == f"cortex_org_pages__{ORG_B}"
+
+    leaked = storage.insert_page(org_a, "Org A secret.", ["A"])
+    assert storage.get_page(org_b, leaked) is None
+    assert storage.query(org_b, "Org A secret", n_results=5) == []
+    assert storage.count(org_b) == 0
+    assert storage.get_page(org_a, leaked)["text"] == "Org A secret."
+
+
+def test_org_and_user_collections_never_collide(tmp_path):
+    """An org_id and a user_id chosen to collide under the OLD shared-prefix
+    scheme (same raw id string) must still land in disjoint collections,
+    because the org prefix shares no characters with the user prefix."""
+    client = _fresh_client(tmp_path)
+    shared_id = ORG_A  # also a legal user_id under _USER_ID_RE
+    user_col = storage.get_collection(client, shared_id)
+    org_col = storage.get_org_collection(client, shared_id)
+    assert user_col.name != org_col.name
+    assert user_col.name == f"cortex_pages__{shared_id}"
+    assert org_col.name == f"cortex_org_pages__{shared_id}"
+
+    leaked = storage.insert_page(user_col, "User secret.", ["U"])
+    # Cross-namespace get_page fails closed exactly like the per-user case.
+    assert storage.get_page(org_col, leaked) is None
+    assert storage.count(org_col) == 0
+
+
+def test_adversarial_org_user_id_pair_cannot_collide(tmp_path):
+    """Even an org_id built to literally equal an existing user's full
+    collection name can't produce the same Chroma collection name, since the
+    org prefix is prepended on top of it."""
+    client = _fresh_client(tmp_path)
+    user_col = storage.get_collection(client, "alice")
+    assert user_col.name == "cortex_pages__alice"
+    # "cortex_pages__alice" itself is not a valid org_id (not 32 hex chars),
+    # so no org can even be named to attempt the collision in the first
+    # place — validation rejects it before a collection is ever opened.
+    with pytest.raises(ValueError):
+        storage.get_org_collection(client, "cortex_pages__alice")

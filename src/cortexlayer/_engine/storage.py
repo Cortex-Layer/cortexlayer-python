@@ -31,6 +31,19 @@ no unscoped full-store scan anywhere. ``default`` keeps the legacy
 ``cortex_pages__<user>``. Page IDs are uuid4 hex (globally unique), so a leaked
 cross-user ID simply does not exist in the caller's collection: ``get_page``
 returns None (fails closed).
+
+Org isolation (task 0107, arch §9.2): org "hive mind" pools get their own
+namespace, ``cortex_org_pages__<org_id>`` via ``get_org_collection`` /
+``collection_name_for_org`` — a deliberately distinct prefix from
+``cortex_pages``/``cortex_pages__<user_id>``, not a shared one relying on
+charset discipline to avoid collisions (§8.2 already produced one real bug
+that way). ``org_id`` is opaque/server-generated (uuid4 hex, never
+user-chosen — ``orgs.create_org`` in the backend), so
+``validate_org_id`` checks exactly that shape. Every op in this module still
+takes a passed-in handle, so an org collection is just one more scoped
+collection in the same shared Chroma instance — no new crash-safety
+constraint, same single-writer-per-``DATA_DIR`` rule as the per-user case.
+No migration needed: orgs are greenfield, every org collection starts empty.
 """
 
 from __future__ import annotations
@@ -56,6 +69,15 @@ MAX_USER_ID_LENGTH = 64
 # in the 0027 notes (0026 proposed bare ^[A-Za-z0-9_-]{1,64}$).
 _USER_ID_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9_-]{0,62}[A-Za-z0-9])?")
 
+ORG_COLLECTION_PREFIX = "cortex_org_pages__"
+# org_id is always server-generated (uuid4().hex, orgs.create_org) — never
+# user-chosen — so this is the exact shape produced, not a broad charset
+# allowance like _USER_ID_RE. §9.2: the org/user namespace split already
+# makes cross-prefix collision structurally impossible; this just means a
+# malformed/forged org_id is rejected rather than silently building some
+# other collection name.
+_ORG_ID_RE = re.compile(r"[0-9a-f]{32}")
+
 
 def validate_user_id(user_id: str) -> str:
     """Validate-never-mangle per §8.4: return ``user_id`` or raise ValueError.
@@ -77,6 +99,15 @@ def validate_user_id(user_id: str) -> str:
     return user_id
 
 
+def validate_org_id(org_id: str) -> str:
+    """Validate-never-mangle, same contract as ``validate_user_id`` (§8.4):
+    return ``org_id`` or raise ValueError. ``org_id`` is opaque server-
+    generated uuid4 hex (lowercase, 32 chars) — never user-chosen."""
+    if not isinstance(org_id, str) or _ORG_ID_RE.fullmatch(org_id) is None:
+        raise ValueError(f"invalid org_id: must be a uuid4 hex string; got {org_id!r}")
+    return org_id
+
+
 def collection_name_for_user(user_id: str = DEFAULT_USER_ID) -> str:
     """Map a validated user_id to its Chroma collection name.
 
@@ -87,6 +118,20 @@ def collection_name_for_user(user_id: str = DEFAULT_USER_ID) -> str:
     if user_id == DEFAULT_USER_ID:
         return COLLECTION_NAME
     return f"{USER_COLLECTION_PREFIX}{user_id}"
+
+
+def collection_name_for_org(org_id: str) -> str:
+    """Map a validated org_id to its Chroma collection name (§9.2).
+
+    Always ``cortex_org_pages__<org_id>`` — no ``default``-style shortcut
+    (orgs are greenfield, there is no legacy org collection to stay
+    compatible with) and a prefix that shares no characters in common with
+    ``USER_COLLECTION_PREFIX``, so no ``org_id``/``user_id`` pair can ever
+    collide on the final collection name regardless of charset overlap
+    between the two ID spaces.
+    """
+    validate_org_id(org_id)
+    return f"{ORG_COLLECTION_PREFIX}{org_id}"
 
 
 def utc_now_iso() -> str:
@@ -157,6 +202,27 @@ def get_collection(
     """
     resolved = name if name is not None else collection_name_for_user(user_id)
     kwargs: dict = {"name": resolved}
+    if embedding_function is not None:
+        kwargs["embedding_function"] = embedding_function
+    return client.get_or_create_collection(**kwargs)
+
+
+def get_org_collection(
+    client: chromadb.PersistentClient,
+    org_id: str,
+    embedding_function=None,
+) -> Collection:
+    """Get-or-create ``org_id``'s pages collection (org-scoped handle, §9.2).
+
+    Deliberately a separate function from ``get_collection`` rather than an
+    overload — orgs have no ``default``/legacy-name special case and no
+    optional ``name`` override, so there's no ambiguous shared code path a
+    caller could accidentally hand a user_id into expecting org semantics
+    (or vice versa). Every page op below takes whichever handle you pass it,
+    so callers that only ever hold an org handle have no way to reach a user
+    collection, and vice versa — isolation by construction, not a filter.
+    """
+    kwargs: dict = {"name": collection_name_for_org(org_id)}
     if embedding_function is not None:
         kwargs["embedding_function"] = embedding_function
     return client.get_or_create_collection(**kwargs)
