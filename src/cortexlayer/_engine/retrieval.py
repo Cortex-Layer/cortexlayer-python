@@ -9,6 +9,8 @@ so picking ``links[0]`` picked an arbitrary neighbor, not the most relevant one)
 
 from __future__ import annotations
 
+from typing import Optional
+
 from chromadb.api.models.Collection import Collection
 
 from . import fusion, storage
@@ -126,6 +128,109 @@ def expand_links(
     return passages
 
 
+def retrieve_fused_multi(
+    pools: list[tuple[Collection, Optional[str], list[dict]]],
+    query: str,
+    top_n: int = 1,
+    query_embedding: list[float] | None = None,
+    rrf_k: int = fusion.DEFAULT_RRF_K,
+    use_mmr: bool = True,
+    mmr_lambda: float = fusion.DEFAULT_MMR_LAMBDA,
+) -> list[dict]:
+    """Task 0109 / arch §9.4: :func:`retrieve_fused` generalized to fan out
+    across several Chroma collections at once — exactly two in production
+    (the caller's personal pool + one active org pool, never every org the
+    caller belongs to), though this function itself places no limit on
+    ``pools`` and doesn't enforce that business rule — the caller does.
+
+    ``pools`` is ``[(collection, pool_label, seeds), ...]`` — ``seeds`` are
+    already fetched per-collection by the caller (this backend's own seed
+    scoring: vector distance for raw, 0079's fused score for facts), exactly
+    like :func:`retrieve_fused`'s ``seeds`` parameter, just once per pool.
+    Link-expansion and page hydration both run against each candidate's OWN
+    originating collection (tracked through the merge via closures over that
+    pool's ``collection`` — a candidate id is never looked up in a different
+    pool's collection than the one it was found in). Each pool contributes
+    its own seed-rank voice and link-rank voice to one shared RRF pass
+    (fusing by rank position *within* each pool's own ranking, never a
+    cross-pool score comparison — pools can use different scoring scales),
+    plus the usual single recency voice computed once over the combined
+    candidate pool when ``query`` has a temporal cue, then one MMR re-rank
+    over everything.
+
+    ``pool_label`` is stamped onto each resulting passage's ``tags["pool"]``
+    (0090 provenance) so a merged result still shows which pool it came
+    from — e.g. ``"personal"`` / ``"org:<org_id>"``. ``None`` omits the key
+    entirely, which is what makes a single ``(collection, None, seeds)``
+    pool reduce to :func:`retrieve_fused` bit-for-bit.
+    """
+    by_id: dict[str, dict] = {}
+    voices: list[list[str]] = []
+    total_seeds = 0
+
+    for collection, pool_label, seeds in pools:
+        seed_ids = [s["id"] for s in seeds]
+        total_seeds += len(seed_ids)
+        for s in seeds:
+            tags = dict(s.get("tags") or {})
+            if pool_label is not None:
+                tags["pool"] = pool_label
+            by_id[s["id"]] = {
+                "page_id": s["id"], "text": s["text"], "via": "direct",
+                "created_at": s.get("created_at", ""), "tags": tags or None,
+            }
+        voices.append(seed_ids)
+
+        neighbor_ids = sorted({nid for s in seeds for nid in s.get("links", [])} - set(seed_ids))
+        link_from: dict[str, str] = {}
+        for s in seeds:
+            for nid in s.get("links", []):
+                if nid in neighbor_ids:
+                    link_from.setdefault(nid, s["id"])
+
+        link_ranked = (
+            _rank_neighbors(collection, neighbor_ids, len(neighbor_ids),
+                             query=query, query_embedding=query_embedding)
+            if neighbor_ids else []
+        )
+        link_ids = [nid for nid, _ in link_ranked]
+        for nid in link_ids:
+            target = storage.get_page(collection, nid)
+            if target is not None:
+                tags = dict(target.get("tags") or {})
+                if pool_label is not None:
+                    tags["pool"] = pool_label
+                by_id[nid] = {
+                    "page_id": nid, "text": target["text"], "via": "link",
+                    "linked_from": link_from.get(nid),
+                    "created_at": target.get("created_at", ""), "tags": tags or None,
+                }
+        voices.append(link_ids)
+
+    if not by_id:
+        return []
+
+    if fusion.has_temporal_cue(query):
+        voices.append(fusion.recency_rank(list(by_id.values())))
+    scores = fusion.reciprocal_rank_fusion(voices, k=rrf_k)
+
+    pool = [{**passage, "score": scores.get(pid, 0.0)} for pid, passage in by_id.items()]
+    pool.sort(key=lambda p: p["score"], reverse=True)
+
+    target_count = min(total_seeds + top_n * total_seeds, len(pool))
+    if use_mmr:
+        selected = fusion.mmr_rerank(pool, target_count, lam=mmr_lambda)
+    else:
+        selected = pool[:target_count]
+    for p in selected:
+        p.pop("created_at", None)  # internal to fusion, not part of the public passage shape
+        if p.get("linked_from") is None:
+            p.pop("linked_from", None)
+        if not p.get("tags"):
+            p.pop("tags", None)
+    return selected
+
+
 def retrieve_fused(
     collection: Collection,
     seeds: list[dict],
@@ -158,58 +263,13 @@ def retrieve_fused(
     chooses FROM a wider pool, but the OUTPUT is the same size, so a paired
     eval against :func:`expand_links` isolates fusion+MMR from a change in
     retrieval breadth.
+
+    Task 0109: a thin single-pool call into :func:`retrieve_fused_multi`
+    (``pool_label=None``, so no ``tags["pool"]`` gets added) — bit-for-bit
+    the same selection/order/scores as before that generalization.
     """
-    seed_ids = [s["id"] for s in seeds]
-    by_id: dict[str, dict] = {
-        s["id"]: {
-            "page_id": s["id"], "text": s["text"], "via": "direct",
-            "created_at": s.get("created_at", ""), "tags": s.get("tags"),
-        }
-        for s in seeds
-    }
-
-    neighbor_ids = sorted({nid for s in seeds for nid in s.get("links", [])} - set(seed_ids))
-    link_from: dict[str, str] = {}
-    for s in seeds:
-        for nid in s.get("links", []):
-            if nid in neighbor_ids:
-                link_from.setdefault(nid, s["id"])
-
-    link_ranked = (
-        _rank_neighbors(collection, neighbor_ids, len(neighbor_ids),
-                         query=query, query_embedding=query_embedding)
-        if neighbor_ids else []
+    return retrieve_fused_multi(
+        [(collection, None, seeds)], query, top_n=top_n,
+        query_embedding=query_embedding, rrf_k=rrf_k,
+        use_mmr=use_mmr, mmr_lambda=mmr_lambda,
     )
-    link_ids = [nid for nid, _ in link_ranked]
-    for nid in link_ids:
-        target = storage.get_page(collection, nid)
-        if target is not None:
-            by_id[nid] = {
-                "page_id": nid, "text": target["text"], "via": "link",
-                "linked_from": link_from.get(nid),
-                "created_at": target.get("created_at", ""), "tags": target.get("tags"),
-            }
-
-    if not by_id:
-        return []
-
-    voices = [seed_ids, link_ids]
-    if fusion.has_temporal_cue(query):
-        voices.append(fusion.recency_rank(list(by_id.values())))
-    scores = fusion.reciprocal_rank_fusion(voices, k=rrf_k)
-
-    pool = [{**passage, "score": scores.get(pid, 0.0)} for pid, passage in by_id.items()]
-    pool.sort(key=lambda p: p["score"], reverse=True)
-
-    target_count = min(len(seed_ids) + top_n * len(seed_ids), len(pool))
-    if use_mmr:
-        selected = fusion.mmr_rerank(pool, target_count, lam=mmr_lambda)
-    else:
-        selected = pool[:target_count]
-    for p in selected:
-        p.pop("created_at", None)  # internal to fusion, not part of the public passage shape
-        if p.get("linked_from") is None:
-            p.pop("linked_from", None)
-        if not p.get("tags"):
-            p.pop("tags", None)
-    return selected

@@ -233,3 +233,86 @@ def test_retrieve_fused_temporal_query_does_not_crash_or_drop_results(tmp_path):
     passages = retrieval.retrieve_fused(col, seeds, "When was the director born?")
     assert len({p["page_id"] for p in passages}) == len(passages)
     assert len(passages) == 2
+
+
+# --- retrieve_fused_multi (task 0109: multi-pool fan-out) -------------------
+
+
+def test_retrieve_fused_multi_single_pool_matches_retrieve_fused_bit_for_bit(tmp_path):
+    col = _fresh_collection(tmp_path)
+    _seed_two_hop(col)
+    query = "Who directed Inception?"
+    seeds = storage.query(col, query, n_results=5)
+    single = retrieval.retrieve_fused(col, seeds, query)
+    multi = retrieval.retrieve_fused_multi([(col, None, seeds)], query)
+    assert multi == single
+
+
+def test_retrieve_fused_multi_merges_two_pools(tmp_path):
+    personal = storage.get_client(persist_dir=str(tmp_path / "chroma")).get_or_create_collection(
+        "personal"
+    )
+    org = storage.get_client(persist_dir=str(tmp_path / "chroma")).get_or_create_collection("org")
+    ingestion.ingest_text(personal, "Alice's vault code is 4471.")
+    ingestion.ingest_text(org, "The team's director of engineering is Christopher Nolan.")
+    query = "Who is the director of engineering?"
+    personal_seeds = storage.query(personal, query, n_results=5)
+    org_seeds = storage.query(org, query, n_results=5)
+    passages = retrieval.retrieve_fused_multi(
+        [(personal, "personal", personal_seeds), (org, "org:abc", org_seeds)], query
+    )
+    texts = [p["text"] for p in passages]
+    assert any("Christopher Nolan" in t for t in texts)
+    assert any("4471" in t for t in texts)
+
+
+def test_retrieve_fused_multi_tags_each_passage_with_its_pool(tmp_path):
+    personal = storage.get_client(persist_dir=str(tmp_path / "chroma")).get_or_create_collection(
+        "personal"
+    )
+    org = storage.get_client(persist_dir=str(tmp_path / "chroma")).get_or_create_collection("org")
+    ingestion.ingest_text(personal, "Alice's vault code is 4471.")
+    ingestion.ingest_text(org, "The team picked Postgres.")
+    query = "vault code Postgres"
+    personal_seeds = storage.query(personal, query, n_results=5)
+    org_seeds = storage.query(org, query, n_results=5)
+    passages = retrieval.retrieve_fused_multi(
+        [(personal, "personal", personal_seeds), (org, "org:xyz", org_seeds)], query
+    )
+    by_text = {p["text"]: p for p in passages}
+    assert by_text["Alice's vault code is 4471."]["tags"]["pool"] == "personal"
+    assert by_text["The team picked Postgres."]["tags"]["pool"] == "org:xyz"
+
+
+def test_retrieve_fused_multi_hydrates_links_from_their_own_collection(tmp_path):
+    """A seed's linked neighbor lives in the SAME pool as the seed — multi-pool
+    hydration must look it up there, not in the other pool's collection."""
+    client = storage.get_client(persist_dir=str(tmp_path / "chroma"))
+    personal = client.get_or_create_collection("personal")
+    org = client.get_or_create_collection("org")
+    seed_id = ingestion.ingest_text(personal, "The director of Inception is Christopher Nolan.")[0]
+    storage.insert_page(
+        personal, "Christopher Nolan was born on July 30, 1970.",
+        ["Christopher Nolan"], page_id="a" * 32,
+    )
+    storage.append_link(personal, seed_id, "a" * 32)
+    org_seed_id = ingestion.ingest_text(org, "The team's budget is $50,000.")[0]
+
+    personal_seeds = [storage.get_page(personal, seed_id)]
+    personal_seeds[0]["score"] = 0.0
+    org_seeds = [storage.get_page(org, org_seed_id)]
+    org_seeds[0]["score"] = 0.0
+
+    query = "When was the director of Inception born?"
+    passages = retrieval.retrieve_fused_multi(
+        [(personal, "personal", personal_seeds), (org, "org:abc", org_seeds)], query
+    )
+    texts = [p["text"] for p in passages]
+    assert any("1970" in t for t in texts)
+    linked = next(p for p in passages if "1970" in p["text"])
+    assert linked["tags"]["pool"] == "personal"
+
+
+def test_retrieve_fused_multi_empty_pools_returns_empty(tmp_path):
+    col = _fresh_collection(tmp_path)
+    assert retrieval.retrieve_fused_multi([(col, "personal", []), (col, "org:abc", [])], "q") == []

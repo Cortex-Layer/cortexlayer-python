@@ -61,6 +61,14 @@ log = logging.getLogger("cortexlayer.facts")
 
 FACTS_PREFIX = "cortex_facts__"
 ENTITIES_PREFIX = "cortex_facts_entities__"
+# Org "hive mind" pools (task 0108, arch §9.2/§9.4): a deliberately distinct
+# prefix from the personal ones above, same reasoning as
+# ``storage.ORG_COLLECTION_PREFIX`` vs ``USER_COLLECTION_PREFIX`` — org_id is
+# opaque/server-generated (uuid4 hex) so there is no charset overlap to worry
+# about, but a shared prefix would still make an org_id/user_id collision a
+# silent cross-tenant bug instead of a structural impossibility.
+FACTS_ORG_PREFIX = "cortex_facts_org__"
+ENTITIES_ORG_PREFIX = "cortex_facts_entities_org__"
 CONTEXT_MESSAGES = 10          # last-k messages shown to the extractor
 EXISTING_FACTS_CONTEXT = 10    # similar existing facts shown to the extractor
 ENTITY_REUSE_SIMILARITY = 0.95  # an entity this close to an existing one is the same entity
@@ -263,6 +271,40 @@ class FactEngine:
     def _entities(self, user_id: str):
         return self._open(ENTITIES_PREFIX + user_id)
 
+    def collection_for_org(self, org_id: str):
+        """The org's facts collection (task 0108, arch §9.2) — parallel to
+        :meth:`collection`, own namespace, no ``default``-style special case
+        (orgs are greenfield)."""
+        storage.validate_org_id(org_id)
+        return self._open(FACTS_ORG_PREFIX + org_id)
+
+    def _entities_for_org(self, org_id: str):
+        storage.validate_org_id(org_id)
+        return self._open(ENTITIES_ORG_PREFIX + org_id)
+
+    def _scope(self, user_id: Optional[str], org_id: Optional[str]):
+        """``(facts_collection, entities_collection, messages_scope_key)`` for
+        one call — either the personal pool (``user_id``) or one org pool
+        (``org_id``), never both. ``org_id`` wins when both are given a value
+        (callers only ever pass one in practice: :meth:`add`/:meth:`seeds`
+        route ``user_id`` through unchanged for its other uses — e.g. an
+        audit trail on the caller's side — but it plays no part in collection
+        selection once ``org_id`` is set).
+
+        The messages scope key reuses ``FACTS_ORG_PREFIX + org_id`` rather
+        than ``org_id`` alone — distinct from any personal ``user_id`` key by
+        construction, same collision-proofing as the collection prefixes
+        above, even though the messages table is just conversational context
+        (not isolated data) so a collision there would be low-stakes, not a
+        security bug."""
+        if org_id is not None:
+            return (
+                self.collection_for_org(org_id),
+                self._entities_for_org(org_id),
+                FACTS_ORG_PREFIX + org_id,
+            )
+        return self.collection(user_id), self._entities(user_id), user_id
+
     def _embed(self, texts: Sequence[str], action: str) -> List[List[float]]:
         try:
             return self._embedder.embed_batch(list(texts), action)
@@ -286,21 +328,32 @@ class FactEngine:
         text: str,
         timestamp: Optional[str] = None,
         tags: Optional[Dict[str, Any]] = None,
+        *,
+        org_id: Optional[str] = None,
     ) -> List[Dict[str, str]]:
         """Extract facts from ``text`` and store them. Returns ``[{"id", "text"}]``
         (empty if nothing was worth remembering). Raises :class:`LLMError` if the
         model or embedder is unreachable — that is not "no facts".
 
         ``tags`` (task 0090): optional provenance metadata, stamped as-is onto
-        every fact extracted from this one call (via ``storage.insert_page``)."""
+        every fact extracted from this one call (via ``storage.insert_page``).
+
+        ``org_id`` (task 0108, arch §9.2/§9.3): write into that org's shared
+        pool instead of ``user_id``'s personal one — same extraction/dedup/
+        supersede pipeline either way, just a different destination
+        collection (and conversation-context scope, so the extractor sees
+        the shared pool's own recent history, not any one member's). The
+        caller is responsible for stamping ``tags["author"]`` with the
+        actual calling member (this engine has no notion of "caller" vs
+        "pool owner" beyond that tag)."""
         if timestamp:
             text = ingestion.apply_timestamp(text, timestamp)
         messages = [{"role": "user", "content": text}]
         parsed = f"user: {text}\n"
-        facts = self.collection(user_id)
+        facts, ecol, scope = self._scope(user_id, org_id)
 
         # Phase 0-1: context + similar existing facts (ids hidden behind "0".."9")
-        last = self._messages.last(user_id)
+        last = self._messages.last(scope)
         existing_texts: List[Dict[str, str]] = []
         existing_hashes: set = set()
         total = facts.count()
@@ -331,7 +384,7 @@ class FactEngine:
             raise LLMError(f"LLM extraction failed: {e}") from e
         extracted = parse_extraction(reply)
         if not extracted:
-            self._messages.save(user_id, messages)
+            self._messages.save(scope, messages)
             return []
 
         # Phase 3: batch embed (fall back one by one; an outage must not look like "nothing")
@@ -375,7 +428,7 @@ class FactEngine:
                 extra["predicate"] = str(m["predicate"])
             records.append({"text": t, "vector": vectors[t], "extra": extra})
         if not records:
-            self._messages.save(user_id, messages)
+            self._messages.save(scope, messages)
             return []
 
         # Phase 6: persist
@@ -398,11 +451,11 @@ class FactEngine:
 
         # Phase 7: entity index (best effort, as Mem0)
         try:
-            self._link_entities(user_id, records)
+            self._link_entities(ecol, records)
         except Exception as e:  # noqa: BLE001
             log.warning("entity linking failed: %s", e)
 
-        self._messages.save(user_id, messages)
+        self._messages.save(scope, messages)
         return out
 
     def _supersede_facts(
@@ -454,7 +507,9 @@ class FactEngine:
         for pid in to_close:
             facts.update(ids=[pid], metadatas=[{"valid_until": valid_from}])
 
-    def _link_entities(self, user_id: str, records: List[Dict[str, Any]]) -> None:
+    def _link_entities(self, col, records: List[Dict[str, Any]]) -> None:
+        """``col`` is the already-resolved entity-index collection (personal
+        or org, task 0108 — the caller picks via :meth:`_scope`)."""
         if self._spacy is None:
             return
         per_record = entity_extraction.extract_entities_batch(
@@ -473,7 +528,6 @@ class FactEngine:
         keys = list(merged)
         vecs = self._embed([merged[k][1] for k in keys], "add")
 
-        col = self._entities(user_id)
         exact: Dict[str, Any] = {}
         if col.count():
             listed = col.get(include=["metadatas", "documents"])
@@ -574,7 +628,13 @@ class FactEngine:
     # --- search ---
 
     def seeds(
-        self, user_id: str, query: str, limit: int, as_of: Optional[str] = None
+        self,
+        user_id: Optional[str],
+        query: str,
+        limit: int,
+        as_of: Optional[str] = None,
+        *,
+        org_id: Optional[str] = None,
     ) -> List[dict]:
         """Top ``limit`` facts for ``query`` as storage-shaped page dicts with a
         fused ``score`` (higher = better).
@@ -584,8 +644,13 @@ class FactEngine:
         predicate) is excluded. Pass ``as_of`` (an ISO timestamp) to
         retrieve history as it stood at that moment instead of now. A store
         that never enables ``supersede`` never closes a window, so this is a
-        no-op for it — every fact stays visible, exactly as before 0094."""
-        facts = self.collection(user_id)
+        no-op for it — every fact stays visible, exactly as before 0094.
+
+        ``org_id`` (task 0108, arch §9.4): search that org's shared pool
+        instead of ``user_id``'s personal one (``user_id`` may be ``None``
+        in that case — it plays no part in collection selection once
+        ``org_id`` is set, see :meth:`_scope`)."""
+        facts, ecol, _scope_key = self._scope(user_id, org_id)
         total = facts.count()
         if total == 0:
             return []
@@ -604,7 +669,7 @@ class FactEngine:
             )
             if _is_current(meta, as_of)
         ]
-        boosts = self._entity_boosts(user_id, query_entities) if query_entities else {}
+        boosts = self._entity_boosts(ecol, query_entities) if query_entities else {}
         keyword: Dict[str, float] = {}
         if self._kw_weight > 0:
             keyword = self._keyword_scores(facts, query, qvec, candidates, as_of)
@@ -654,7 +719,9 @@ class FactEngine:
             log.warning("keyword scoring failed: %s", e)
             return {}
 
-    def _entity_boosts(self, user_id: str, query_entities: Sequence[Any]) -> Dict[str, float]:
+    def _entity_boosts(self, col, query_entities: Sequence[Any]) -> Dict[str, float]:
+        """``col`` is the already-resolved entity-index collection (personal
+        or org, task 0108 — the caller picks via :meth:`_scope`)."""
         seen: set = set()
         deduped: List[str] = []
         for _type, text in list(query_entities)[: scoring.MAX_QUERY_ENTITIES]:
@@ -662,7 +729,6 @@ class FactEngine:
             if key and key not in seen:
                 seen.add(key)
                 deduped.append(text)
-        col = self._entities(user_id)
         total = col.count()
         if not deduped or total == 0:
             return {}

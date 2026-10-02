@@ -189,6 +189,12 @@ class Memory:
         except ValueError as e:
             raise InvalidRequestError(str(e)) from e
 
+    def _check_org(self, org_id: str) -> str:
+        try:
+            return self._e.storage.validate_org_id(org_id)
+        except ValueError as e:
+            raise InvalidRequestError(str(e)) from e
+
     def _uid(self, user_id: Optional[str]) -> str:
         """``None`` means the instance's default user."""
         return self._check_uid(self._default_user if user_id is None else user_id)
@@ -212,6 +218,23 @@ class Memory:
         server. Treat it as read-only: writing through it bypasses embedding,
         entity extraction and the facts pipeline."""
         return self._col(user_id)
+
+    def _org_col(self, org_id: str):
+        org_id = self._check_org(org_id)
+        key = ("org", org_id)
+        with self._lock:
+            col = self._collections.get(key)
+            if col is None:
+                col = self._collections[key] = (
+                    self._facts.collection_for_org(org_id) if self._facts is not None
+                    else self._e.storage.get_org_collection(self._client, org_id)
+                )
+            return col
+
+    def org_collection(self, org_id: str) -> Any:
+        """An org pool's underlying Chroma collection (task 0108, arch §9.2) —
+        parallel to :meth:`collection`, same read-only caveat."""
+        return self._org_col(org_id)
 
     def _passages(
         self, user_id, col, query: str, limit: int, expand_links: bool,
@@ -262,6 +285,7 @@ class Memory:
         user_id: Optional[str] = None,
         timestamp: Optional[str] = None,
         tags: Optional[Dict[str, Any]] = None,
+        org_id: Optional[str] = None,
     ) -> AddResult:
         """Save ``text`` as memory. Long text is chunked into several small
         pages (one fact each works best). ``timestamp`` (e.g. ``"8 May, 2023"``)
@@ -277,14 +301,35 @@ class Memory:
         share one person's memory (the "hive mind") while still recording,
         for later inspection, which one wrote a given fact.
 
+        ``org_id`` (task 0108, arch §9.2/§9.3): write into that org's shared
+        pool instead of ``user_id``'s personal one (same extraction/embedding
+        pipeline either way — ``backend="facts"`` runs the same LLM
+        distillation for an org pool as for a personal one). Every page this
+        call creates is additionally stamped ``tags["author"] = user_id``
+        (resolved the same way ``user_id`` always is — explicit param, else
+        this instance's default) — the author tag task 0110's supersede
+        logic and 0105 §9.1's admin-visibility reasoning both depend on.
+        Validating that ``user_id`` actually belongs to ``org_id`` is the
+        caller's job (e.g. the server checks ``org_members`` before this
+        call) — this method only validates ``org_id``'s own shape.
+
         Does not relink unless ``auto_relink`` is on."""
         need_str(text, "text")
         if timestamp is not None:
             need_str(timestamp, "timestamp")
         tags = need_tags(tags, "tags")
-        col = self._col(user_id)
+        if org_id is not None:
+            org_id = self._check_org(org_id)
+            tags = {**(tags or {}), "author": self._uid(user_id)}
+            col = self._org_col(org_id)
+        else:
+            col = self._col(user_id)
         if self._facts is not None:
-            ids = [f["id"] for f in self._facts.add(self._uid(user_id), text, timestamp, tags)]
+            ids = [
+                f["id"] for f in self._facts.add(
+                    self._uid(user_id), text, timestamp, tags, org_id=org_id
+                )
+            ]
         else:
             ids = self._e.ingestion.add_text(col, text, self._nlp, timestamp=timestamp, tags=tags)
         if self._auto_relink and ids:
@@ -319,6 +364,69 @@ class Memory:
         if col.count() == 0:
             return []
         passages = self._passages(user_id, col, query, limit, expand_links, as_of=as_of)
+        return [self._e.shaping.search_result(p) for p in passages]
+
+    def _seeds(
+        self, col, query: str, limit: int, *,
+        user_id: Optional[str] = None, org_id: Optional[str] = None,
+        as_of: Optional[str] = None,
+    ) -> List[dict]:
+        """Raw seed search against one already-resolved collection (personal
+        or org) — this backend's own scoring, pre-link-expansion. Shared by
+        :meth:`search_multi_pool` (task 0109) so facts-backend seed search
+        (entity boosts, current-truth filtering) works identically for an
+        org pool as for a personal one."""
+        if self._facts is not None:
+            return self._facts.seeds(user_id, query, limit, as_of=as_of, org_id=org_id)
+        return self._e.storage.query(col, query, n_results=limit)
+
+    def search_multi_pool(
+        self,
+        query: str,
+        *,
+        user_id: Optional[str] = None,
+        org_id: str,
+        limit: int = 50,
+    ) -> List[SearchResult]:
+        """Task 0109 / arch §9.4: fan out seed search + link-expansion across
+        exactly two pools — the caller's personal pool and one org pool —
+        and unify them with 0093's RRF fusion instead of running each pool
+        independently. Every result's ``tags`` carries ``"pool"``
+        (``"personal"`` or ``"org:<org_id>"``) in addition to whatever was
+        already there (e.g. 0108's ``"author"``), so provenance survives the
+        merge.
+
+        This method does not check organization membership — the caller
+        (the server) validates ``org_id`` against ``org_members`` before
+        calling it, same division of labor as :meth:`add`. It only ever
+        touches these two pools, never every org the caller belongs to.
+
+        An empty combined pool (both collections empty, or org_id's
+        collection does not exist yet) returns ``[]``, same as
+        :meth:`search` on an empty store."""
+        need_str(query, "query")
+        need_int(limit, "limit", 1, MAX_SEARCH_LIMIT)
+        org_id = self._check_org(org_id)
+        personal_col = self._col(user_id)
+        org_col = self._org_col(org_id)
+        if personal_col.count() == 0 and org_col.count() == 0:
+            return []
+        uid = self._uid(user_id)
+        personal_seeds = (
+            self._seeds(personal_col, query, limit, user_id=uid) if personal_col.count() else []
+        )
+        org_seeds = (
+            self._seeds(org_col, query, limit, org_id=org_id) if org_col.count() else []
+        )
+        q_emb = self._facts.embed_query(query) if self._facts is not None else None
+        passages = self._e.retrieval.retrieve_fused_multi(
+            [
+                (personal_col, "personal", personal_seeds),
+                (org_col, f"org:{org_id}", org_seeds),
+            ],
+            query,
+            query_embedding=q_emb,
+        )
         return [self._e.shaping.search_result(p) for p in passages]
 
     def answer(

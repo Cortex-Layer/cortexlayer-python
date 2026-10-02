@@ -302,7 +302,7 @@ def test_entity_boosts_point_at_the_facts_linked_to_the_query_entity(tmp_path, s
     with_ent.add("u", "x")
     col = with_ent.collection("u")
     ids = {storage.get_page(col, i)["text"]: i for i in col.get()["ids"]}
-    boosts = with_ent._entity_boosts("u", [("PROPER", "Boston")])
+    boosts = with_ent._entity_boosts(with_ent._entities("u"), [("PROPER", "Boston")])
     assert ids["Boston has a support group."] in boosts and ids["Zebra runs quickly downtown."] not in boosts
     assert boosts[ids["Boston has a support group."]] == pytest.approx(0.5, abs=0.01)   # exact entity match ~ sim 1.0
 
@@ -555,6 +555,77 @@ def test_facts_validation_is_shared_with_raw(fmem):
                  lambda: fmem.add("x", user_id="../bad")):
         with pytest.raises(InvalidRequestError):
             call()
+
+
+# --- org pools (task 0108, arch §9.2/§9.3) ---------------------------------------------
+
+ORG_A = "1" * 32
+ORG_B = "2" * 32
+
+
+def test_add_with_org_id_writes_to_org_pool_not_personal(eng):
+    eng.add("alice", "Caroline adopted a dog named Max.", org_id=ORG_A)
+    assert eng.collection_for_org(ORG_A).count() == 1
+    assert eng.collection("alice").count() == 0
+
+
+def test_add_with_org_id_is_shared_across_members(eng):
+    """Two different users writing into the same org land in the same pool —
+    there is no per-member subdivision inside an org collection (§9.1: all
+    roles read/write the org pool equally)."""
+    eng.add("alice", "Caroline adopted a dog named Max.", org_id=ORG_A)
+    eng.add("bob", "Melanie visited Paris.", org_id=ORG_A)
+    col = eng.collection_for_org(ORG_A)
+    assert col.count() == 2
+    texts = {d for d in col.get(include=["documents"])["documents"]}
+    assert texts == {"Caroline adopted a dog named Max.", "Melanie visited Paris."}
+
+
+def test_two_orgs_are_isolated_from_each_other(eng):
+    eng.add("alice", "Caroline adopted a dog named Max.", org_id=ORG_A)
+    eng.add("alice", "Melanie visited Paris.", org_id=ORG_B)
+    assert eng.collection_for_org(ORG_A).count() == 1
+    assert eng.collection_for_org(ORG_B).count() == 1
+    a_texts = {p["text"] for p in eng.seeds(None, "Caroline", 5, org_id=ORG_A)}
+    b_texts = {p["text"] for p in eng.seeds(None, "Caroline", 5, org_id=ORG_B)}
+    assert a_texts == {"Caroline adopted a dog named Max."}
+    assert "Caroline adopted a dog named Max." not in b_texts
+
+
+def test_seeds_with_org_id_never_sees_personal_facts(eng):
+    eng.add("alice", "Caroline adopted a dog named Max.")  # personal, no org_id
+    eng.add("alice", "Melanie visited Paris.", org_id=ORG_A)
+    org_texts = {p["text"] for p in eng.seeds(None, "Melanie Paris", 5, org_id=ORG_A)}
+    personal_texts = {p["text"] for p in eng.seeds("alice", "Melanie Paris", 5)}
+    assert org_texts == {"Melanie visited Paris."}
+    assert "Melanie visited Paris." not in personal_texts
+    assert "Caroline adopted a dog named Max." not in org_texts
+
+
+def test_org_messages_context_is_shared_across_members_not_personal(eng, llm):
+    """The last-k-messages context (resolves pronouns across an ``add`` call)
+    is keyed by org, not by the calling member — alice's org write should be
+    visible as context for bob's very next org write, and never bleed into
+    alice's own personal context."""
+    eng.add("alice", "Caroline adopted a dog named Max.", org_id=ORG_A)
+    eng.add("bob", "The dog's name was mentioned earlier.", org_id=ORG_A)
+    # The second add's prompt included alice's prior org message as context.
+    last_prompt = llm.calls[-1][1]
+    assert "Caroline adopted a dog named Max." in last_prompt
+    eng.add("alice", "Something personal and unrelated.")
+    personal_prompt = llm.calls[-1][1]
+    assert "Caroline adopted a dog named Max." not in personal_prompt
+
+
+def test_org_write_caller_stamps_author_tag(eng):
+    """The engine itself doesn't invent the author tag — it just stores
+    whatever ``tags`` the caller (``Memory.add``, per 0108) passes through,
+    same as any other ``tags`` use (task 0090)."""
+    out = eng.add("alice", "Caroline adopted a dog named Max.",
+                   tags={"author": "alice"}, org_id=ORG_A)
+    col = eng.collection_for_org(ORG_A)
+    page = storage.get_page(col, out[0]["id"])
+    assert page["tags"] == {"author": "alice"}
 
 
 # --- bulk import (migration from a Mem0 store) ----------------------------------------

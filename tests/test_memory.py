@@ -18,6 +18,7 @@ from cortexlayer import (
     PageList,
     SearchResult,
 )
+from cortexlayer._engine import storage
 
 
 # --- round trip -----------------------------------------------------------------
@@ -195,6 +196,88 @@ def test_get_all_pagination_and_filter(mem):
     seen = {p.id for p in mem.get_all(limit=3).pages} | {p.id for p in mem.get_all(limit=3, offset=3).pages} \
         | {p.id for p in mem.get_all(limit=3, offset=6).pages}
     assert len(seen) == 8                                            # windows don't overlap
+
+
+# --- org pools (task 0108/0109, arch §9) -----------------------------------------
+
+ORG_A = "1" * 32
+ORG_B = "2" * 32
+
+
+def test_add_with_org_id_writes_to_org_pool_not_personal(mem):
+    pid = mem.add("Team decided to use Postgres.", user_id="alice", org_id=ORG_A).page_ids[0]
+    assert mem.org_collection(ORG_A).count() == 1
+    assert mem.count(user_id="alice") == 0  # never landed in alice's personal pool
+    page = storage.get_page(mem.org_collection(ORG_A), pid)
+    assert page["text"] == "Team decided to use Postgres."
+
+
+def test_add_with_org_id_stamps_author_tag(mem):
+    pid = mem.add("Team decided to use Postgres.", user_id="alice", org_id=ORG_A).page_ids[0]
+    page = storage.get_page(mem.org_collection(ORG_A), pid)
+    assert page["tags"] == {"author": "alice"}
+
+
+def test_add_with_org_id_merges_author_into_caller_tags(mem):
+    pid = mem.add(
+        "Team decided to use Postgres.", user_id="alice", org_id=ORG_A,
+        tags={"source": "slack"},
+    ).page_ids[0]
+    page = storage.get_page(mem.org_collection(ORG_A), pid)
+    assert page["tags"] == {"source": "slack", "author": "alice"}
+
+
+def test_add_with_bad_org_id_raises_invalid_request(mem):
+    with pytest.raises(InvalidRequestError):
+        mem.add("x", user_id="alice", org_id="not-a-real-org-id")
+
+
+def test_two_orgs_isolated_via_memory(mem):
+    mem.add("Postgres decision.", user_id="alice", org_id=ORG_A)
+    mem.add("Postgres decision.", user_id="alice", org_id=ORG_B)
+    assert mem.org_collection(ORG_A).count() == 1
+    assert mem.org_collection(ORG_B).count() == 1
+    assert mem.org_collection(ORG_A).name != mem.org_collection(ORG_B).name
+
+
+def test_search_multi_pool_fans_out_personal_and_org(mem):
+    mem.add("Alice's personal vault code is 4471.", user_id="alice")
+    mem.add("The team's Postgres decision happened in March.", user_id="alice", org_id=ORG_A)
+    hits = mem.search_multi_pool("Postgres decision", user_id="alice", org_id=ORG_A)
+    texts = {h.text for h in hits}
+    assert "The team's Postgres decision happened in March." in texts
+
+
+def test_search_multi_pool_tags_each_hit_with_its_pool(mem):
+    mem.add("Alice's personal vault code is 4471.", user_id="alice")
+    mem.add("The team's Postgres decision happened in March.", user_id="alice", org_id=ORG_A)
+    hits = mem.search_multi_pool(
+        "vault code Postgres decision", user_id="alice", org_id=ORG_A, limit=10
+    )
+    pools = {h.tags.get("pool") for h in hits}
+    assert pools == {"personal", f"org:{ORG_A}"}
+
+
+def test_search_multi_pool_never_surfaces_a_different_orgs_facts(mem):
+    mem.add("Secret roadmap note.", user_id="alice", org_id=ORG_B)
+    mem.add("Unrelated personal note.", user_id="alice")
+    hits = mem.search_multi_pool("Secret roadmap note", user_id="alice", org_id=ORG_A, limit=10)
+    assert all("Secret roadmap" not in h.text for h in hits)
+
+
+def test_search_multi_pool_on_empty_org_pool_still_returns_personal_hits(mem):
+    mem.add("Alice's personal vault code is 4471.", user_id="alice")
+    hits = mem.search_multi_pool("vault code", user_id="alice", org_id=ORG_A)
+    assert any("4471" in h.text for h in hits)
+
+
+def test_search_multi_pool_on_totally_empty_pools_is_empty(mem):
+    assert mem.search_multi_pool("anything", user_id="alice", org_id=ORG_A) == []
+
+
+def test_search_multi_pool_validates_org_id(mem):
+    with pytest.raises(InvalidRequestError):
+        mem.search_multi_pool("q", user_id="alice", org_id="nope")
 
 
 # --- users ----------------------------------------------------------------------
