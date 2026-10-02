@@ -31,11 +31,18 @@ Differences from Mem0, all deliberate:
   ``valid_from``/``valid_until`` validity window (schema always present, independent of
   this flag — a fact never gets a ``valid_until`` unless something actually supersedes
   it). When on, the extraction prompt also asks for a ``subject``/``predicate`` pair per
-  fact; a new fact sharing (subject, predicate) with an existing OPEN fact closes that
-  fact's window (``valid_until = `` the new fact's ``valid_from``) — Mem0 has no
-  equivalent, it is pure append-only. ``seeds()`` defaults to current-truth-only
-  (``valid_from <= as_of <= valid_until``, ``as_of`` = now); pass ``as_of`` to retrieve
-  history. Not part of Mem0's design at all — see ``docs/cortex-architecture.md`` §7.
+  fact; a new fact sharing (subject, predicate) with an existing OPEN fact *from the same
+  author* closes that fact's window (``valid_until = `` the new fact's ``valid_from``) —
+  Mem0 has no equivalent, it is pure append-only. Task 0110 (arch §9.5) generalized the
+  match key to ``(author, subject, predicate)`` for org "hive mind" pools: a different
+  author sharing (subject, predicate) closes neither fact, instead linking them both
+  directions (``storage.append_link``) so link-expansion surfaces both attributed claims
+  together. ``author`` = a fact's ``tags.author`` (0090) if present, else the write's own
+  ``user_id`` — in a personal pool every fact implicitly shares one author, so this is a
+  no-op generalization there (byte-for-byte the same as 0094). ``seeds()`` defaults to
+  current-truth-only (``valid_from <= as_of <= valid_until``, ``as_of`` = now); pass
+  ``as_of`` to retrieve history. Not part of Mem0's design at all — see
+  ``docs/cortex-architecture.md`` §7/§9.5.
 """
 
 from __future__ import annotations
@@ -445,7 +452,7 @@ class FactEngine:
         # must not lose the new fact, it just means an old one stays visible too).
         if self._supersede:
             try:
-                self._supersede_facts(facts, records, stamp)
+                self._supersede_facts(facts, records, stamp, user_id)
             except Exception as e:  # noqa: BLE001
                 log.warning("supersede-on-write failed: %s", e)
 
@@ -459,10 +466,32 @@ class FactEngine:
         return out
 
     def _supersede_facts(
-        self, facts: Any, records: List[Dict[str, Any]], valid_from: str
+        self, facts: Any, records: List[Dict[str, Any]], valid_from: str, user_id: str,
     ) -> None:
-        """Close any OTHER fact in this collection sharing a new record's
-        normalized (subject, predicate) and still open (no ``valid_until``).
+        """Close any OTHER fact sharing a new record's (author, subject,
+        predicate) and still open (no ``valid_until``); link instead of
+        close across authors (task 0110, arch §9.5).
+
+        The match key is ``(author, subject, predicate)``, not just
+        ``(subject, predicate)`` — ``author`` = a fact's ``tags.author``
+        (0090) if present, else ``user_id`` (the same value already used to
+        pick the collection). In a personal pool every fact implicitly
+        shares one author (there's exactly one ``user_id`` for the whole
+        collection), so the key degenerates back to plain ``(subject,
+        predicate)`` and behavior is byte-for-byte unchanged from 0094; the
+        author dimension only does anything inside a shared org pool where
+        writes carry different authors.
+
+        Same author, same key -> close the old fact's window, exactly as
+        0094. Different author, same (subject, predicate) -> close neither;
+        link them both directions instead (``storage.append_link``, the same
+        ``links`` field the entity-linking pass already populates), so a
+        seed hit on either member's attributed claim pulls the other in via
+        ordinary link-expansion. Accepted limitation, not solved here: a new
+        write only links to whatever's currently open under its key *at
+        write time*, not a fully-meshed historical graph across every past
+        cross-author pair — consistent with link-expansion already being
+        single-hop/non-exhaustive elsewhere (§2.4/§5).
 
         Exact-string match on normalized (trim+lowercase) subject/predicate —
         the extraction prompt already asks the model to reuse a canonical
@@ -471,20 +500,24 @@ class FactEngine:
         rather than layering 0087's fuzzy entity-dedup on top before there's
         evidence exact-match is too brittle in practice. Chained correctly
         within one batch: if two new records in the same ``add()`` call share
-        a key, the second closes the first, not just whatever was open
-        before this call started.
+        a key, the second supersedes/links against the first, not just
+        whatever was open before this call started.
         """
+        def _author(meta: Dict[str, Any]) -> str:
+            return storage._decode_tags(meta.get("tags")).get("author") or user_id
+
         keyed = [
-            (rec["id"], _norm(rec["extra"]["subject"]), _norm(rec["extra"]["predicate"]))
+            (rec["id"], _author(rec["extra"]),
+             _norm(rec["extra"]["subject"]), _norm(rec["extra"]["predicate"]))
             for rec in records
             if rec["extra"].get("subject") and rec["extra"].get("predicate")
         ]
         if not keyed:
             return
         new_ids = {rec["id"] for rec in records}
-        # Read every fact's (subject, predicate, valid_until) once — same
-        # "exact and always in sync, O(facts)" tradeoff _keyword_scores
-        # already makes; fine at the per-user scale facts stores run at.
+        # Read every fact's (tags, subject, predicate, valid_until) once —
+        # same "exact and always in sync, O(facts)" tradeoff _keyword_scores
+        # already makes; fine at the per-user/per-org scale facts stores run at.
         existing = facts.get(include=["metadatas"])
         open_by_key: Dict[tuple, List[str]] = {}
         for pid, meta in zip(existing["ids"], existing["metadatas"] or []):
@@ -496,16 +529,31 @@ class FactEngine:
             subj, pred = meta.get("subject"), meta.get("predicate")
             if not subj or not pred:
                 continue
-            open_by_key.setdefault((_norm(subj), _norm(pred)), []).append(pid)
+            open_by_key.setdefault(
+                (_author(meta), _norm(subj), _norm(pred)), []
+            ).append(pid)
 
         to_close: set = set()
-        for new_id, subj_key, pred_key in keyed:
-            key = (subj_key, pred_key)
-            to_close.update(open_by_key.get(key, ()))
-            open_by_key[key] = [new_id]  # this record is now the open one for this key
+        to_link: List[tuple] = []  # (new_id, other_open_fact_id)
+        for new_id, author, subj_key, pred_key in keyed:
+            same_author_key = (author, subj_key, pred_key)
+            to_close.update(open_by_key.get(same_author_key, ()))
+
+            for (other_author, s, p), ids in open_by_key.items():
+                if other_author == author or s != subj_key or p != pred_key:
+                    continue
+                to_link.extend((new_id, pid) for pid in ids)
+
+            # this record is now the open one for its own (author, subject,
+            # predicate) key — later records in the same batch chain against
+            # it, same as pre-0110, now author-scoped.
+            open_by_key[same_author_key] = [new_id]
 
         for pid in to_close:
             facts.update(ids=[pid], metadatas=[{"valid_until": valid_from}])
+        for new_id, other_id in to_link:
+            storage.append_link(facts, new_id, other_id)
+            storage.append_link(facts, other_id, new_id)
 
     def _link_entities(self, col, records: List[Dict[str, Any]]) -> None:
         """``col`` is the already-resolved entity-index collection (personal

@@ -6,7 +6,7 @@ import json
 import pytest
 
 from cortexlayer import Memory
-from cortexlayer._engine import storage
+from cortexlayer._engine import retrieval, storage
 from cortexlayer._engine.facts import backends
 from cortexlayer._engine.facts.engine import FactEngine, _is_current, _parse_iso
 
@@ -138,6 +138,123 @@ def test_supersede_failure_does_not_lose_the_new_fact(tmp_path, spacy_nlp, monke
     )
     out = _write_preference(on, "User prefers Python.", T1)
     assert out  # add() still returns the fact despite the supersede step blowing up
+
+
+# --- author-scoped matching + cross-author linking (task 0110, arch §9.5) --------------
+
+ORG_A = "3" * 32
+
+
+def _write_org_preference(eng, user_id, text, timestamp):
+    """Writes into ORG_A, stamping ``tags["author"] = user_id`` the way
+    ``Memory.add`` does for a real org write (0108) — the engine itself
+    never invents this tag, see ``test_org_write_caller_stamps_author_tag``
+    in test_facts.py."""
+    eng._test_llm.queue.append(json.dumps({
+        "memory": [{"id": "0", "text": text, "subject": "User", "predicate": "prefers"}]
+    }))
+    return eng.add(user_id, text, timestamp=timestamp, tags={"author": user_id}, org_id=ORG_A)[0]["id"]
+
+
+def test_cross_author_conflict_closes_neither_fact(tmp_path, spacy_nlp):
+    on = _engine(tmp_path, spacy_nlp, "org-cross", supersede=True)
+    alice_id = _write_org_preference(on, "alice", "User prefers Python.", T1)
+    bob_id = _write_org_preference(on, "bob", "User prefers Rust.", T2)
+
+    col = on.collection_for_org(ORG_A)
+    metas = dict(zip(*[col.get(ids=[alice_id, bob_id], include=["metadatas"])[k]
+                        for k in ("ids", "metadatas")]))
+    assert metas[alice_id].get("valid_until") is None
+    assert metas[bob_id].get("valid_until") is None
+
+    texts = {p["text"] for p in on.seeds(None, "prefers", 10, org_id=ORG_A)}
+    assert texts == {"User prefers Python.", "User prefers Rust."}   # both current — no retraction
+
+
+def test_cross_author_conflict_links_both_directions(tmp_path, spacy_nlp):
+    on = _engine(tmp_path, spacy_nlp, "org-link", supersede=True)
+    alice_id = _write_org_preference(on, "alice", "User prefers Python.", T1)
+    bob_id = _write_org_preference(on, "bob", "User prefers Rust.", T2)
+
+    col = on.collection_for_org(ORG_A)
+    assert storage.get_page(col, alice_id)["links"] == [bob_id]
+    assert storage.get_page(col, bob_id)["links"] == [alice_id]
+
+
+def test_same_author_in_org_pool_still_supersedes_like_0094(tmp_path, spacy_nlp):
+    """Author-scoping only changes cross-author behavior — same author,
+    same (subject, predicate), inside an org pool still closes exactly as
+    0094 does in a personal pool."""
+    on = _engine(tmp_path, spacy_nlp, "org-same-author", supersede=True)
+    old_id = _write_org_preference(on, "alice", "User prefers Python.", T1)
+    _write_org_preference(on, "alice", "User prefers Rust.", T2)
+
+    col = on.collection_for_org(ORG_A)
+    meta = col.get(ids=[old_id], include=["metadatas"])["metadatas"][0]
+    assert meta["valid_until"] == T2
+    texts = {p["text"] for p in on.seeds(None, "prefers", 10, org_id=ORG_A)}
+    assert texts == {"User prefers Rust."}
+
+
+def test_same_author_update_closes_own_fact_but_cross_author_link_survives(tmp_path, spacy_nlp):
+    """A later same-author update still closes that author's own prior
+    fact; the earlier cross-author link must survive the close
+    (§9.5: no-retraction semantics)."""
+    on = _engine(tmp_path, spacy_nlp, "org-mixed", supersede=True)
+    T3 = "2023-09-01T00:00:00+00:00"
+    alice_id = _write_org_preference(on, "alice", "User prefers Python.", T1)
+    bob_id = _write_org_preference(on, "bob", "User prefers Rust.", T2)
+    alice_id2 = _write_org_preference(on, "alice", "User prefers Go.", T3)
+
+    col = on.collection_for_org(ORG_A)
+    alice_meta = col.get(ids=[alice_id], include=["metadatas"])["metadatas"][0]
+    assert alice_meta["valid_until"] == T3   # alice's own earlier fact closed
+
+    # bob's fact kept its original link to alice's now-closed fact (the close
+    # never touches `links`) AND gained a new one to alice's new open fact
+    # (a write always links against whatever's currently open under the
+    # other author's key — the accepted "at write time, not fully meshed"
+    # limitation from the task notes/§9.5).
+    assert set(storage.get_page(col, bob_id)["links"]) == {alice_id, alice_id2}
+    assert storage.get_page(col, alice_id2)["links"] == [bob_id]
+
+    current = {p["text"] for p in on.seeds(None, "prefers", 10, org_id=ORG_A)}
+    assert current == {"User prefers Go.", "User prefers Rust."}
+
+
+def test_seed_on_one_cross_author_fact_pulls_the_other_via_link_expansion(tmp_path, spacy_nlp):
+    on = _engine(tmp_path, spacy_nlp, "org-expand", supersede=True)
+    alice_id = _write_org_preference(on, "alice", "User prefers Python.", T1)
+    bob_id = _write_org_preference(on, "bob", "User prefers Rust.", T2)
+
+    col = on.collection_for_org(ORG_A)
+    query = "User prefers Python."
+    # limit=1: only alice's fact surfaces as a direct seed (the closer
+    # semantic match) — bob's can only appear via link-expansion, isolating
+    # that it really is the link (not a second independent seed hit) that
+    # pulls it in.
+    seeds = on.seeds(None, query, 1, org_id=ORG_A)
+    assert [s["id"] for s in seeds] == [alice_id]
+    # Fact collections hold vectors from the engine's own embedder, not
+    # Chroma's default text function — pass the matching vector explicitly
+    # (see retrieval._rank_neighbors's docstring), not raw query text.
+    passages = retrieval.expand_links(col, seeds, query_embedding=on.embed_query(query))
+    assert {p["page_id"] for p in passages} == {alice_id, bob_id}
+    linked = [p for p in passages if p["via"] == "link"]
+    assert linked and linked[0]["page_id"] == bob_id and linked[0]["linked_from"] == alice_id
+
+
+def test_personal_pool_fallback_author_matches_pre_0110_behavior(tmp_path, spacy_nlp):
+    """No author tag at all (today's personal-pool default): every fact in
+    the collection falls back to the same ``user_id``, so the match key
+    degenerates back to plain (subject, predicate) — byte-for-byte the same
+    outcome as 0094 before this task."""
+    on = _engine(tmp_path, spacy_nlp, "personal-fallback", supersede=True)
+    old_id = _write_preference(on, "User prefers Python.", T1)
+    _write_preference(on, "User prefers Rust.", T2)
+    meta = on.collection("u").get(ids=[old_id], include=["metadatas"])["metadatas"][0]
+    assert meta["valid_until"] == T2
+    assert [p["text"] for p in on.seeds("u", "prefers", 10)] == ["User prefers Rust."]
 
 
 # --- current-truth filter (unit-level) --------------------------------------------------
