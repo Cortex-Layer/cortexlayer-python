@@ -550,9 +550,18 @@ class Memory:
                 self._client.delete_collection(col.name)
         return removed
 
-    def relink(self, *, user_id: Optional[str] = None) -> Dict[str, Any]:
+    def relink(
+        self, *, user_id: Optional[str] = None, org_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """Re-run the batch linking pass (idempotent). Returns
-        ``{"pages": n, "links_written": m}``."""
+        ``{"pages": n, "links_written": m}``.
+
+        ``org_id`` (task 0119 follow-up): relink that org's shared pool
+        instead of the user's own — exclusive, never both. As with
+        :meth:`add`, checking that the caller belongs to the org is the
+        embedder's job; this only validates the ID's shape."""
+        if org_id is not None:
+            return self._e.linking.run_linking_pass(self._org_col(org_id))
         return self._e.linking.run_linking_pass(self._col(user_id))
 
     def count(self, *, user_id: Optional[str] = None) -> int:
